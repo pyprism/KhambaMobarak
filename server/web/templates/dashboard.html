@@ -1,0 +1,149 @@
+{{ template "base.html" . }}
+
+{{ define "content" }}
+<!-- Stats Cards -->
+<div class="row g-4 mb-4">
+    <div class="col-md-4">
+        <div class="card stat-card primary">
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h6 class="text-muted mb-1">Total Devices</h6>
+                        <h2 class="mb-0">{{ .totalDevices }}</h2>
+                    </div>
+                    <div class="text-primary opacity-50">
+                        <i class="bi bi-cpu" style="font-size: 2.5rem;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card stat-card success">
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h6 class="text-muted mb-1">Online</h6>
+                        <h2 class="mb-0 text-success">{{ .onlineDevices }}</h2>
+                    </div>
+                    <div class="text-success opacity-50">
+                        <i class="bi bi-check-circle" style="font-size: 2.5rem;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card stat-card danger">
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h6 class="text-muted mb-1">Offline</h6>
+                        <h2 class="mb-0 text-danger">{{ .offlineDevices }}</h2>
+                    </div>
+                    <div class="text-danger opacity-50">
+                        <i class="bi bi-exclamation-circle" style="font-size: 2.5rem;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-4">
+    <!-- Devices -->
+    <div class="col-lg-8">
+        <div class="card">
+            <div class="card-header bg-white d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-grid-3x3-gap me-2"></i>Devices</h5>
+                <span class="badge bg-secondary">{{ .totalDevices }} total</span>
+            </div>
+            <div class="card-body">
+                {{ if .devices }}
+                <div class="row g-3">
+                    {{ range .devices }}
+                    <div class="col-md-6">
+                        <a href="/devices/{{ .ID }}" class="text-decoration-none">
+                            <div class="card device-card h-100">
+                                <div class="card-body">
+                                    <div class="d-flex align-items-center mb-2">
+                                        <span class="status-indicator {{ if .IsOnline }}status-online{{ else }}status-offline{{ end }}"></span>
+                                        <h6 class="mb-0 text-dark">{{ .Name }}</h6>
+                                    </div>
+                                    <p class="text-muted mb-2 small">
+                                        <i class="bi bi-geo-alt"></i> {{ if .Location }}{{ .Location }}{{ else }}No location{{ end }}
+                                    </p>
+                                    <div class="d-flex justify-content-between align-items-center">
+                                        <span class="badge {{ if .IsOnline }}bg-success{{ else }}bg-danger{{ end }}">
+                                            {{ if .IsOnline }}Online{{ else }}Offline{{ end }}
+                                        </span>
+                                        {{ if .LastSeen }}
+                                        <small class="time-ago" data-time="{{ .LastSeen }}">
+                                            {{ .LastSeen.Format "Jan 02 15:04" }}
+                                        </small>
+                                        {{ else }}
+                                        <small class="time-ago">Never seen</small>
+                                        {{ end }}
+                                    </div>
+                                </div>
+                            </div>
+                        </a>
+                    </div>
+                    {{ end }}
+                </div>
+                {{ else }}
+                <div class="empty-state">
+                    <i class="bi bi-inbox"></i>
+                    <h5>No devices registered</h5>
+                    <p>Use the CLI to add devices:<br>
+                    <code>khamba device create --name "Device Name" --location "Location"</code></p>
+                </div>
+                {{ end }}
+            </div>
+        </div>
+    </div>
+
+    <!-- Recent Outages -->
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header bg-white">
+                <h5 class="mb-0"><i class="bi bi-lightning me-2"></i>Recent Outages</h5>
+            </div>
+            <div class="card-body">
+                {{ if .outages }}
+                {{ range .outages }}
+                <div class="outage-item {{ if .IsOngoing }}ongoing{{ end }}">
+                    <div class="d-flex justify-content-between">
+                        <strong>{{ .DeviceName }}</strong>
+                        {{ if .IsOngoing }}
+                        <span class="badge bg-warning text-dark">ONGOING</span>
+                        {{ end }}
+                    </div>
+                    <small class="text-muted d-block">{{ .Location }}</small>
+                    <div class="mt-1">
+                        <small>
+                            <i class="bi bi-clock"></i>
+                            Started: <span data-time="{{ .StartTime }}">{{ .StartTime.Format "Jan 02 15:04" }}</span>
+                        </small>
+                    </div>
+                    <div>
+                        <small>
+                            <i class="bi bi-hourglass-split"></i>
+                            Duration: <span data-duration="{{ .Duration }}">{{ .Duration }}</span>
+                        </small>
+                    </div>
+                </div>
+                {{ end }}
+                {{ else }}
+                <div class="empty-state py-4">
+                    <i class="bi bi-check-circle"></i>
+                    <h6>No recent outages</h6>
+                    <p class="small">All systems operational</p>
+                </div>
+                {{ end }}
+            </div>
+        </div>
+    </div>
+</div>
+{{ end }}
+
