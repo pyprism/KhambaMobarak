@@ -1,0 +1,40 @@
+.pio
+.idea
+
+# Binaries
+server/khamba
+*.exe
+*.dll
+*.so
+*.dylib
+
+# PlatformIO
+client/.pio/
+client/.vscode/
+client/lib/
+
+# Go
+server/vendor/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Config (keep sample)
+config.json
+
+# Logs
+*.log
+
