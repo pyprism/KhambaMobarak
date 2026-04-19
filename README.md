@@ -1,4 +1,4 @@
-# Khamba Mobarak - Power Outage Monitor
+# Khamba Mobarak - Power Outage Monitor [![Server Tests](https://github.com/pyprism/KhambaMobarak/actions/workflows/server-tests.yaml/badge.svg)](https://github.com/pyprism/KhambaMobarak/actions/workflows/server-tests.yaml) [![codecov](https://codecov.io/gh/pyprism/KhambaMobarak/graph/badge.svg?token=KsWrjlL7wb)](https://codecov.io/gh/pyprism/KhambaMobarak)
 
 A power outage monitoring system using ESP8266/ESP32 devices and a Go server. Track power status across multiple locations with a web dashboard and centralized logging.
 
