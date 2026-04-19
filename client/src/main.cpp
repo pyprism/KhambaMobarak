@@ -18,11 +18,13 @@
 #if defined(ESP32)
     #include <WiFi.h>
     #include <HTTPClient.h>
+    #include <WiFiClientSecure.h>
     #include <LittleFS.h>
     #define FILESYSTEM LittleFS
 #elif defined(ESP8266)
     #include <ESP8266WiFi.h>
     #include <ESP8266HTTPClient.h>
+    #include <WiFiClientSecure.h>
     #include <LittleFS.h>
     #define FILESYSTEM LittleFS
 #else
@@ -51,10 +53,18 @@
 
 #define LED_PIN LED_BUILTIN
 
+// BOOT/FLASH button is used for factory reset of saved configuration.
+// Override RESET_BUTTON_PIN via build flags if your board wiring differs.
+#ifndef RESET_BUTTON_PIN
+    #define RESET_BUTTON_PIN 0
+#endif
+#define RESET_BUTTON_ACTIVE LOW
+#define RESET_HOLD_TIME_MS 5000
+
 // Configuration structure
 struct Config {
     char serverUrl[128];
-    char deviceToken[64];
+    char deviceToken[65];  // 64 hex chars + null terminator
     bool configured;
 };
 
@@ -70,6 +80,8 @@ bool sendEvent(const char* eventType);
 void blinkLed(int times, int delayMs);
 void setupWiFiManager();
 void initFilesystem();
+bool isFactoryResetRequested();
+void clearSavedConfiguration();
 
 void setup() {
     Serial.begin(115200);
@@ -89,11 +101,19 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LED_OFF);
 
+    // BOOT/FLASH button (active LOW with pull-up)
+    pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+
     // Initialize filesystem
     initFilesystem();
 
     // Load configuration
     loadConfig();
+
+    // Hold BOOT/FLASH for RESET_HOLD_TIME_MS during startup to wipe config.
+    if (isFactoryResetRequested()) {
+        clearSavedConfiguration();
+    }
 
     // Setup WiFiManager
     setupWiFiManager();
@@ -107,6 +127,58 @@ void setup() {
 
     // Visual feedback - connected
     blinkLed(3, 200);
+}
+
+bool isFactoryResetRequested() {
+    // Button must stay continuously pressed for the full window.
+    if (digitalRead(RESET_BUTTON_PIN) != RESET_BUTTON_ACTIVE) {
+        return false;
+    }
+
+    Serial.printf("[INFO] Reset button detected. Hold for %d ms to clear config...\n", RESET_HOLD_TIME_MS);
+    unsigned long start = millis();
+    while (millis() - start < RESET_HOLD_TIME_MS) {
+        if (digitalRead(RESET_BUTTON_PIN) != RESET_BUTTON_ACTIVE) {
+            Serial.println("[INFO] Reset canceled");
+            return false;
+        }
+        blinkLed(1, 60);
+        delay(80);
+    }
+
+    Serial.println("[WARN] Factory reset requested");
+    return true;
+}
+
+void clearSavedConfiguration() {
+    Serial.println("[WARN] Clearing saved device configuration...");
+
+    if (FILESYSTEM.exists(CONFIG_FILE)) {
+        if (FILESYSTEM.remove(CONFIG_FILE)) {
+            Serial.println("[OK] Removed local config file");
+        } else {
+            Serial.println("[ERROR] Failed to remove local config file");
+        }
+    }
+
+    // Clear WiFi credentials stored by WiFiManager/SDK.
+    WiFiManager wm;
+    wm.resetSettings();
+
+    #if defined(ESP32)
+    WiFi.disconnect(true, true);
+    #elif defined(ESP8266)
+    WiFi.disconnect(true);
+    #endif
+
+    config.serverUrl[0] = '\0';
+    config.deviceToken[0] = '\0';
+    config.configured = false;
+
+    Serial.println("[OK] Configuration cleared. Rebooting...");
+    blinkLed(5, 120);
+    delay(300);
+    ESP.restart();
 }
 
 void loop() {
@@ -233,7 +305,6 @@ bool sendEvent(const char* eventType) {
         return false;
     }
 
-    WiFiClient wifiClient;
     HTTPClient http;
 
     String url = String(config.serverUrl);
@@ -245,10 +316,28 @@ bool sendEvent(const char* eventType) {
     Serial.print("[DEBUG] Sending to: ");
     Serial.println(url);
 
+    bool isHttps = url.startsWith("https://");
+
+    // Use appropriate client based on URL scheme
+    WiFiClient *client;
+    WiFiClientSecure *secureClient = nullptr;
+    WiFiClient *plainClient = nullptr;
+
+    if (isHttps) {
+        secureClient = new WiFiClientSecure();
+        secureClient->setInsecure();  // Skip certificate verification (for self-signed certs)
+        client = secureClient;
+        Serial.println("[DEBUG] Using HTTPS (insecure mode)");
+    } else {
+        plainClient = new WiFiClient();
+        client = plainClient;
+        Serial.println("[DEBUG] Using HTTP");
+    }
+
     #if defined(ESP32)
     http.begin(url);
     #elif defined(ESP8266)
-    http.begin(wifiClient, url);
+    http.begin(*client, url);
     #endif
 
     http.addHeader("Content-Type", "application/json");
@@ -268,6 +357,10 @@ bool sendEvent(const char* eventType) {
     int httpCode = http.POST(payload);
     String response = http.getString();
     http.end();
+
+    // Clean up allocated clients
+    if (secureClient) delete secureClient;
+    if (plainClient) delete plainClient;
 
     Serial.print("[DEBUG] HTTP Response Code: ");
     Serial.println(httpCode);
@@ -291,7 +384,7 @@ void setupWiFiManager() {
 
     // Custom parameters for server URL and device token
     WiFiManagerParameter customServerUrl("server", "Server URL", config.serverUrl, 128);
-    WiFiManagerParameter customDeviceToken("token", "Device Token", config.deviceToken, 64);
+    WiFiManagerParameter customDeviceToken("token", "Device Token", config.deviceToken, 65);
 
     wm.addParameter(&customServerUrl);
     wm.addParameter(&customDeviceToken);
