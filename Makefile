@@ -1,4 +1,4 @@
-.PHONY: all server client client-esp8266 client-esp32 clean install
+.PHONY: all server client client-esp8266 client-esp32 clean install test coverage coverage-html
 
 # Default target
 all: server client
@@ -55,6 +55,23 @@ deps:
 test:
 	cd server && go test ./...
 
+# Run tests with coverage and filter ignored files from server/.coveragerc
+coverage:
+	cd server && go test -coverprofile=coverage.raw.out ./...
+	cd server && cp coverage.raw.out coverage.out && \
+		while IFS= read -r pattern; do \
+			[ -z "$$pattern" ] && continue; \
+			case "$$pattern" in \
+			\#*) continue ;; \
+			esac; \
+			grep -Ev "$$pattern" coverage.out > coverage.tmp && mv coverage.tmp coverage.out; \
+		done < .coveragerc
+	cd server && go tool cover -func=coverage.out
+
+# Generate HTML coverage report (opens manually)
+coverage-html: coverage
+	cd server && go tool cover -html=coverage.out -o coverage.html
+
 # Help
 help:
 	@echo "Khamba Mobarak - Power Outage Monitor"
@@ -74,5 +91,7 @@ help:
 	@echo "  clean          - Remove build artifacts"
 	@echo "  deps           - Download server dependencies"
 	@echo "  test           - Run server tests"
+	@echo "  coverage       - Run tests and show filtered Go coverage"
+	@echo "  coverage-html  - Generate HTML report at server/coverage.html"
 	@echo "  help           - Show this help message"
 
