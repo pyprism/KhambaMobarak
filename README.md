@@ -78,7 +78,8 @@ pio run -e esp32dev -t upload
 
 4. Reconfiguration:
 
-- To re-enter setup mode you can hold the FLASH/BOOT button on the device during power-on (depending on board) or delete the config file stored in LittleFS and reboot.
+- Hold the `FLASH/BOOT` button for ~5 seconds during startup to clear saved WiFi + device config (`/config.json`) and restart into setup mode.
+- The dedicated hardware `RST/EN` button only reboots the MCU; it cannot be used alone to detect a long-press in firmware.
 
 ## Development Makefile
 
@@ -90,13 +91,20 @@ make server       # build the server binary
 make client-esp8266  # build client for ESP8266
 make client-esp32    # build client for ESP32
 make upload-esp8266  # upload (requires board connected)
+make test         # run server unit tests
+make coverage     # run tests with filtered coverage
 ```
+
+Coverage ignore rules are defined in `server/.coveragerc` (used by `make coverage`).
 
 ## Server CLI Examples
 
 ```bash
 # Start server
 ./khamba serve
+
+# Clear analytics data (keeps devices/tokens)
+./khamba clean
 
 # Custom listen port / DB path
 ./khamba serve --port 9000 --db /path/to/khamba.db
@@ -106,10 +114,22 @@ make upload-esp8266  # upload (requires board connected)
 ./khamba device list
 ./khamba device delete 1
 
+# Send test events from CLI (auto reuses/creates token)
+./khamba dummy-client
+./khamba dummy-client --name "Lab Dummy" --event boot --count 3 --interval 2s
+./khamba dummy-client --server http://192.168.1.100:8080 --name "Remote Test"
+
 # Install/uninstall as systemd user service (Linux)
 ./khamba install
+./khamba install --port 9000 --db /path/to/khamba.db
 ./khamba uninstall
 ```
+
+`clean` (or `serve --clean` / `--reset-analytics`) removes event history and resets `last_seen` for all devices before server start, but keeps the device table and auth tokens intact.
+
+`dummy-client` solves token setup automatically: it looks up a device by `--name` and reuses its existing token; if not found, it creates the device (using `--location`) and generates a token internally before sending events to `/api/events`.
+
+`install` now accepts the same `--port` and `--db` overrides as `serve`, but it persists them into `~/.config/khamba/config.json` so the generated service can keep using plain `khamba serve`.
 
 ## API Endpoints
 
