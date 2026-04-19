@@ -40,7 +40,7 @@ func dashboardHandler(c *gin.Context) {
 	}
 
 	c.HTML(http.StatusOK, "dashboard.html", gin.H{
-		"title":          "Power Monitor Dashboard",
+		"title":          "Power Outage Monitor Dashboard",
 		"devices":        devices,
 		"outages":        outages,
 		"totalDevices":   len(devices),
