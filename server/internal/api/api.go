@@ -11,6 +11,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// chartRange maps URL param values to (hours, buckets)
+var chartRanges = map[string][2]int{
+	"24h": {24, 24},   // 24 one-hour buckets
+	"7d":  {168, 42},  // 42 four-hour buckets
+	"30d": {720, 30},  // 30 one-day buckets
+	"3m":  {2160, 45}, // 45 two-day buckets
+	"6m":  {4320, 54}, // 54 ~80-hour buckets
+	"1y":  {8760, 52}, // 52 one-week buckets
+}
+
 // EventRequest represents the incoming event from ESP device
 type EventRequest struct {
 	EventType string `json:"event_type" binding:"required"`
@@ -30,6 +40,7 @@ func RegisterRoutes(r *gin.Engine) {
 		api.DELETE("/devices/:id", deleteDevice)
 		api.GET("/devices/:id/events", getDeviceEvents)
 		api.GET("/devices/:id/outages", getDeviceOutages)
+		api.GET("/devices/:id/chart", getDeviceChartData)
 
 		// Dashboard data endpoints
 		api.GET("/outages", getAllOutages)
@@ -171,6 +182,34 @@ func getDeviceOutages(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, outages)
+}
+
+// getDeviceChartData returns time-bucketed event data for charts
+// Query param: range = 24h | 7d | 30d | 3m | 6m | 1y  (default: 24h)
+func getDeviceChartData(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid device ID"})
+		return
+	}
+
+	rangeKey := c.DefaultQuery("range", "24h")
+	params, ok := chartRanges[rangeKey]
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid range; use 24h, 7d, 30d, 3m, 6m, or 1y"})
+		return
+	}
+
+	buckets, err := models.GetEventChartData(uint(id), params[0], params[1])
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get chart data"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"range":   rangeKey,
+		"buckets": buckets,
+	})
 }
 
 // getAllOutages returns recent outages across all devices
