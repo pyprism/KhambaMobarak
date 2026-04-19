@@ -2,6 +2,7 @@
 package models
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -92,6 +93,33 @@ func GetDeviceByID(id uint) (*Device, error) {
 		return nil, err
 	}
 	return &device, nil
+}
+
+// GetDeviceByName retrieves the first device by name.
+func GetDeviceByName(name string) (*Device, error) {
+	var device Device
+	if err := DB.Where("name = ?", name).Order("id ASC").First(&device).Error; err != nil {
+		return nil, err
+	}
+	return &device, nil
+}
+
+// GetOrCreateDeviceByName reuses an existing device token by name or creates a new device.
+func GetOrCreateDeviceByName(name, location string) (*Device, string, bool, error) {
+	device, err := GetDeviceByName(name)
+	if err == nil {
+		return device, device.Token, false, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, "", false, fmt.Errorf("failed to query device by name: %w", err)
+	}
+
+	createdDevice, token, err := CreateDevice(name, location)
+	if err != nil {
+		return nil, "", false, err
+	}
+
+	return createdDevice, token, true, nil
 }
 
 // DeleteDevice deletes a device by ID
@@ -249,4 +277,79 @@ func GetAllOutages(limit int) ([]OutageInfo, error) {
 	}
 
 	return allOutages, nil
+}
+
+// ResetAnalyticsData clears derived analytics while keeping device identity/token data.
+// It removes all events and resets last_seen for every device.
+func ResetAnalyticsData() error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("DELETE FROM events").Error; err != nil {
+			return fmt.Errorf("failed to clear events: %w", err)
+		}
+
+		if err := tx.Model(&Device{}).Where("1 = 1").Update("last_seen", nil).Error; err != nil {
+			return fmt.Errorf("failed to reset device last_seen: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// ChartBucket holds aggregated event counts for one time bucket
+type ChartBucket struct {
+	Label      string `json:"label"`     // Human-readable bucket label
+	Timestamp  int64  `json:"timestamp"` // Unix ms for JS Date
+	Heartbeats int    `json:"heartbeats"`
+	Boots      int    `json:"boots"`
+	Total      int    `json:"total"`
+}
+
+// GetEventChartData returns time-bucketed event counts for a device.
+// rangeHours controls how far back to look; buckets controls how many buckets to split into.
+func GetEventChartData(deviceID uint, rangeHours int, buckets int) ([]ChartBucket, error) {
+	now := time.Now()
+	from := now.Add(-time.Duration(rangeHours) * time.Hour)
+	bucketDur := time.Duration(rangeHours) * time.Hour / time.Duration(buckets)
+
+	var events []Event
+	if err := DB.Where("device_id = ? AND timestamp >= ?", deviceID, from).
+		Order("timestamp ASC").Find(&events).Error; err != nil {
+		return nil, fmt.Errorf("failed to fetch events for chart: %w", err)
+	}
+
+	result := make([]ChartBucket, buckets)
+	for i := 0; i < buckets; i++ {
+		bucketStart := from.Add(time.Duration(i) * bucketDur)
+		bucketEnd := bucketStart.Add(bucketDur)
+		mid := bucketStart.Add(bucketDur / 2)
+
+		// Choose label format based on bucket duration
+		var label string
+		switch {
+		case bucketDur < time.Hour:
+			label = bucketStart.Format("15:04")
+		case bucketDur < 24*time.Hour:
+			label = bucketStart.Format("Jan 2 15:00")
+		default:
+			label = bucketStart.Format("Jan 2")
+		}
+
+		b := ChartBucket{
+			Label:     label,
+			Timestamp: mid.UnixMilli(),
+		}
+		for _, e := range events {
+			if !e.Timestamp.Before(bucketStart) && e.Timestamp.Before(bucketEnd) {
+				b.Total++
+				if e.EventType == EventTypeBoot {
+					b.Boots++
+				} else {
+					b.Heartbeats++
+				}
+			}
+		}
+		result[i] = b
+	}
+
+	return result, nil
 }
