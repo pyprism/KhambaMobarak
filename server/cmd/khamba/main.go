@@ -2,15 +2,20 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"khamba/internal/api"
 	"khamba/internal/config"
@@ -42,6 +47,19 @@ func main() {
 	}
 	serveCmd.Flags().IntP("port", "p", 0, "Port to listen on (default: 8080)")
 	serveCmd.Flags().StringP("db", "d", "", "Database file path")
+	serveCmd.Flags().Bool("clean", false, "Clear analytics data (events, last_seen) before starting")
+	serveCmd.Flags().Bool("reset-analytics", false, "Alias of --clean")
+
+	// Clean command (shortcut for `serve --clean`)
+	cleanCmd := &cobra.Command{
+		Use:   "clean",
+		Short: "Clear analytics data and start the server",
+		RunE:  runClean,
+	}
+	cleanCmd.Flags().IntP("port", "p", 0, "Port to listen on (default: 8080)")
+	cleanCmd.Flags().StringP("db", "d", "", "Database file path")
+	cleanCmd.Flags().Bool("clean", true, "Clear analytics data (always enabled for this command)")
+	cleanCmd.Flags().Bool("reset-analytics", false, "Alias of --clean")
 
 	// Device commands
 	deviceCmd := &cobra.Command{
@@ -73,6 +91,21 @@ func main() {
 
 	deviceCmd.AddCommand(deviceCreateCmd, deviceListCmd, deviceDeleteCmd)
 
+	// Dummy client command
+	dummyClientCmd := &cobra.Command{
+		Use:   "dummy-client",
+		Short: "Send test events to the server using an auto-managed device token",
+		RunE:  runDummyClient,
+	}
+	dummyClientCmd.Flags().String("server", "", "Server base URL (default: http://localhost:<configured-port>)")
+	dummyClientCmd.Flags().String("name", "Dummy Client", "Device name to reuse/create")
+	dummyClientCmd.Flags().String("location", "CLI", "Device location when auto-creating")
+	dummyClientCmd.Flags().String("event", models.EventTypeHeartbeat, "Event type to send: boot|heartbeat")
+	dummyClientCmd.Flags().Int("count", 1, "Number of events to send")
+	dummyClientCmd.Flags().Duration("interval", 10*time.Second, "Delay between events")
+	dummyClientCmd.Flags().IntP("port", "p", 0, "Port used for default server URL when --server is unset")
+	dummyClientCmd.Flags().StringP("db", "d", "", "Database file path")
+
 	// Install command
 	installCmd := &cobra.Command{
 		Use:   "install",
@@ -80,6 +113,8 @@ func main() {
 		Long:  `Install the Khamba binary to XDG config directory and set up systemd service for auto start.`,
 		RunE:  runInstall,
 	}
+	installCmd.Flags().IntP("port", "p", 0, "Persist server port in config before installing service")
+	installCmd.Flags().StringP("db", "d", "", "Persist database file path in config before installing service")
 
 	// Uninstall command
 	uninstallCmd := &cobra.Command{
@@ -88,7 +123,7 @@ func main() {
 		RunE:  runUninstall,
 	}
 
-	rootCmd.AddCommand(serveCmd, deviceCmd, installCmd, uninstallCmd)
+	rootCmd.AddCommand(serveCmd, cleanCmd, deviceCmd, dummyClientCmd, installCmd, uninstallCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -103,11 +138,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Override with flags
-	if port, _ := cmd.Flags().GetInt("port"); port > 0 {
-		cfg.Port = port
-	}
-	if dbPath, _ := cmd.Flags().GetString("db"); dbPath != "" {
-		cfg.DBPath = dbPath
+	if err := applyConfigOverrides(cmd, cfg); err != nil {
+		return err
 	}
 
 	// Ensure directories exist
@@ -118,6 +150,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Initialize database
 	if err := models.InitDB(cfg.DBPath); err != nil {
 		return fmt.Errorf("failed to initialize database: %w", err)
+	}
+
+	cleanAnalytics, _ := cmd.Flags().GetBool("clean")
+	resetAnalytics, _ := cmd.Flags().GetBool("reset-analytics")
+	if cleanAnalytics || resetAnalytics {
+		if err := models.ResetAnalyticsData(); err != nil {
+			return fmt.Errorf("failed to reset analytics data: %w", err)
+		}
+		fmt.Println("Analytics data cleaned (events removed, device last_seen reset).")
 	}
 
 	// Set Gin mode
@@ -154,21 +195,30 @@ func runServe(cmd *cobra.Command, args []string) error {
 	return r.Run(addr)
 }
 
+func runClean(cmd *cobra.Command, args []string) error {
+	// Force cleanup behavior for the shortcut command.
+	if err := cmd.Flags().Set("clean", "true"); err != nil {
+		return fmt.Errorf("failed to enable clean mode: %w", err)
+	}
+	return runServe(cmd, args)
+}
+
 func loadTemplates() (*template.Template, error) {
-	tmpl := template.New("")
-
-	// Add template functions
-	tmpl.Funcs(template.FuncMap{
-		"formatDuration": func(d interface{}) string {
-			return fmt.Sprintf("%v", d)
-		},
-	})
-
 	// Get embedded templates filesystem
 	templatesFS, err := web.GetTemplatesFS()
 	if err != nil {
 		return nil, err
 	}
+
+	// Template functions
+	funcs := template.FuncMap{
+		"formatDuration": func(d interface{}) string {
+			return fmt.Sprintf("%v", d)
+		},
+	}
+
+	// Create root template
+	root := template.New("").Funcs(funcs)
 
 	// Read all template files
 	entries, err := fs.ReadDir(templatesFS, ".")
@@ -177,22 +227,46 @@ func loadTemplates() (*template.Template, error) {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".html") {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".html") {
 			continue
 		}
 
-		content, err := fs.ReadFile(templatesFS, entry.Name())
+		content, err := fs.ReadFile(templatesFS, name)
 		if err != nil {
 			return nil, err
 		}
 
-		_, err = tmpl.New(entry.Name()).Parse(string(content))
+		// Parse all templates into the same root template set.
+		// Each file uses {{ define "filename.html" }} to define its template.
+		// base.html defines shared partials: styles, navbar, footer, scripts.
+		_, err = root.Parse(string(content))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to parse %s: %w", name, err)
 		}
 	}
 
-	return tmpl, nil
+	return root, nil
+}
+
+func applyConfigOverrides(cmd *cobra.Command, cfg *config.Config) error {
+	port, err := cmd.Flags().GetInt("port")
+	if err != nil {
+		return fmt.Errorf("failed to read port flag: %w", err)
+	}
+	if port > 0 {
+		cfg.Port = port
+	}
+
+	dbPath, err := cmd.Flags().GetString("db")
+	if err != nil {
+		return fmt.Errorf("failed to read db flag: %w", err)
+	}
+	if dbPath != "" {
+		cfg.DBPath = dbPath
+	}
+
+	return nil
 }
 
 func runDeviceCreate(cmd *cobra.Command, args []string) error {
@@ -300,6 +374,109 @@ func runDeviceDelete(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func runDummyClient(cmd *cobra.Command, args []string) error {
+	eventType, _ := cmd.Flags().GetString("event")
+	if eventType != models.EventTypeBoot && eventType != models.EventTypeHeartbeat {
+		return fmt.Errorf("invalid event type %q (must be boot or heartbeat)", eventType)
+	}
+
+	count, _ := cmd.Flags().GetInt("count")
+	if count <= 0 {
+		return fmt.Errorf("count must be greater than 0")
+	}
+
+	interval, _ := cmd.Flags().GetDuration("interval")
+	if interval < 0 {
+		return fmt.Errorf("interval cannot be negative")
+	}
+
+	name, _ := cmd.Flags().GetString("name")
+	location, _ := cmd.Flags().GetString("location")
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("device name cannot be empty")
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+	if err := applyConfigOverrides(cmd, cfg); err != nil {
+		return err
+	}
+	if err := config.EnsureDirectories(); err != nil {
+		return fmt.Errorf("failed to create directories: %w", err)
+	}
+	if err := models.InitDB(cfg.DBPath); err != nil {
+		return fmt.Errorf("failed to initialize database: %w", err)
+	}
+
+	serverURL, _ := cmd.Flags().GetString("server")
+	if strings.TrimSpace(serverURL) == "" {
+		serverURL = fmt.Sprintf("http://localhost:%d", cfg.Port)
+	}
+	serverURL = strings.TrimSpace(serverURL)
+	if _, err := url.ParseRequestURI(serverURL); err != nil {
+		return fmt.Errorf("invalid server URL %q: %w", serverURL, err)
+	}
+
+	device, token, created, err := models.GetOrCreateDeviceByName(name, location)
+	if err != nil {
+		return fmt.Errorf("failed to resolve device token: %w", err)
+	}
+
+	if created {
+		fmt.Printf("Created device '%s' (ID: %d) and generated token.\n", device.Name, device.ID)
+	} else {
+		fmt.Printf("Reusing device '%s' (ID: %d) token.\n", device.Name, device.ID)
+	}
+
+	endpoint := strings.TrimRight(serverURL, "/") + "/api/events"
+	for i := 0; i < count; i++ {
+		if err := postDummyEvent(endpoint, token, eventType); err != nil {
+			return fmt.Errorf("event %d/%d failed: %w", i+1, count, err)
+		}
+		fmt.Printf("Sent %s event %d/%d to %s\n", eventType, i+1, count, endpoint)
+
+		if i < count-1 && interval > 0 {
+			time.Sleep(interval)
+		}
+	}
+
+	return nil
+}
+
+func postDummyEvent(endpoint, token, eventType string) error {
+	payload := map[string]any{
+		"event_type": eventType,
+		"timestamp":  time.Now().Unix(),
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to encode payload: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	return nil
+}
+
 func runInstall(cmd *cobra.Command, args []string) error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("systemd installation is only supported on Linux")
@@ -335,15 +512,20 @@ func runInstall(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("✅ Binary installed to: %s\n", binPath)
 
-	// Create default config
-	cfg, err := config.DefaultConfig()
+	// Load existing config (or defaults if not created yet), then persist install overrides.
+	cfg, err := config.Load()
 	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+	if err := applyConfigOverrides(cmd, cfg); err != nil {
 		return err
 	}
 	if err := cfg.Save(); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
-	fmt.Printf("✅ Config created at: %s\n", filepath.Join(configDir, config.ConfigFileName))
+	fmt.Printf("✅ Config saved at: %s\n", filepath.Join(configDir, config.ConfigFileName))
+	fmt.Printf("   Port: %d\n", cfg.Port)
+	fmt.Printf("   Database: %s\n", cfg.DBPath)
 
 	// Create systemd user service
 	homeDir, _ := os.UserHomeDir()
