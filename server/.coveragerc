@@ -1,0 +1,5 @@
+# Coverage profile ignore rules for Go coverage filtering.
+# Each non-empty, non-comment line is a regex removed from coverage profile lines.
+^khamba/cmd/khamba/main\.go:
+^khamba/web/embed\.go:
+
