@@ -38,3 +38,6 @@ config.json
 # Logs
 *.log
 
+/server/coverage.html
+/server/coverage.out
+/server/coverage.raw.out
