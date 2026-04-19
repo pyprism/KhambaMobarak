@@ -130,7 +130,7 @@ func main() {
 	}
 }
 
-func runServe(cmd *cobra.Command, args []string) error {
+func runServe(cmd *cobra.Command, _ []string) error {
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
@@ -269,7 +269,7 @@ func applyConfigOverrides(cmd *cobra.Command, cfg *config.Config) error {
 	return nil
 }
 
-func runDeviceCreate(cmd *cobra.Command, args []string) error {
+func runDeviceCreate(cmd *cobra.Command, _ []string) error {
 	name, _ := cmd.Flags().GetString("name")
 	location, _ := cmd.Flags().GetString("location")
 
@@ -305,7 +305,7 @@ func runDeviceCreate(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runDeviceList(cmd *cobra.Command, args []string) error {
+func runDeviceList(_ *cobra.Command, _ []string) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -374,7 +374,7 @@ func runDeviceDelete(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runDummyClient(cmd *cobra.Command, args []string) error {
+func runDummyClient(cmd *cobra.Command, _ []string) error {
 	eventType, _ := cmd.Flags().GetString("event")
 	if eventType != models.EventTypeBoot && eventType != models.EventTypeHeartbeat {
 		return fmt.Errorf("invalid event type %q (must be boot or heartbeat)", eventType)
@@ -448,7 +448,6 @@ func runDummyClient(cmd *cobra.Command, args []string) error {
 func postDummyEvent(endpoint, token, eventType string) error {
 	payload := map[string]any{
 		"event_type": eventType,
-		"timestamp":  time.Now().Unix(),
 	}
 
 	body, err := json.Marshal(payload)
@@ -477,7 +476,7 @@ func postDummyEvent(endpoint, token, eventType string) error {
 	return nil
 }
 
-func runInstall(cmd *cobra.Command, args []string) error {
+func runInstall(cmd *cobra.Command, _ []string) error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("systemd installation is only supported on Linux")
 	}
@@ -565,7 +564,7 @@ WantedBy=default.target
 	return nil
 }
 
-func runUninstall(cmd *cobra.Command, args []string) error {
+func runUninstall(_ *cobra.Command, _ []string) error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("systemd uninstallation is only supported on Linux")
 	}

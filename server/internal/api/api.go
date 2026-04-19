@@ -24,7 +24,6 @@ var chartRanges = map[string][2]int{
 // EventRequest represents the incoming event from ESP device
 type EventRequest struct {
 	EventType string `json:"event_type" binding:"required"`
-	Timestamp int64  `json:"timestamp"` // Device uptime (optional)
 }
 
 // RegisterRoutes registers all API routes
