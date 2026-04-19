@@ -171,3 +171,142 @@ func TestGetOrCreateDeviceByNameReusesExistingToken(t *testing.T) {
 		t.Fatalf("expected existing token to be reused")
 	}
 }
+
+func TestDeleteDeviceRemovesRecord(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Delete Me", "Tmp")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	if err := DeleteDevice(device.ID); err != nil {
+		t.Fatalf("DeleteDevice failed: %v", err)
+	}
+
+	if _, err := GetDeviceByID(device.ID); err == nil {
+		t.Fatalf("expected deleted device lookup to fail")
+	}
+}
+
+func TestGetBootEventsFiltersByType(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Boot Node", "Lab")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	if _, err := RecordEvent(device.ID, EventTypeHeartbeat); err != nil {
+		t.Fatalf("RecordEvent heartbeat failed: %v", err)
+	}
+	if _, err := RecordEvent(device.ID, EventTypeBoot); err != nil {
+		t.Fatalf("RecordEvent boot failed: %v", err)
+	}
+
+	boots, err := GetBootEvents(device.ID, 10)
+	if err != nil {
+		t.Fatalf("GetBootEvents failed: %v", err)
+	}
+	if len(boots) != 1 {
+		t.Fatalf("expected 1 boot event, got %d", len(boots))
+	}
+	if boots[0].EventType != EventTypeBoot {
+		t.Fatalf("expected boot event type, got %q", boots[0].EventType)
+	}
+}
+
+func TestGetOutagesDetectsGap(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Gap Node", "Plant")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	base := time.Now().Add(-20 * time.Minute)
+	events := []Event{
+		{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: base},
+		{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: base.Add(6 * time.Minute)},
+	}
+	if err := DB.Create(&events).Error; err != nil {
+		t.Fatalf("failed creating test events: %v", err)
+	}
+
+	outages, err := GetOutages(device.ID, 10)
+	if err != nil {
+		t.Fatalf("GetOutages failed: %v", err)
+	}
+	if len(outages) == 0 {
+		t.Fatalf("expected at least one outage from event gap")
+	}
+	if outages[0].Duration < 2*time.Minute {
+		t.Fatalf("expected outage duration over threshold, got %s", outages[0].Duration)
+	}
+}
+
+func TestGetAllOutagesAppliesLimit(t *testing.T) {
+	setupTestDB(t)
+
+	deviceA, _, err := CreateDevice("A", "One")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+	deviceB, _, err := CreateDevice("B", "Two")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	base := time.Now().Add(-40 * time.Minute)
+	events := []Event{
+		{DeviceID: deviceA.ID, EventType: EventTypeHeartbeat, Timestamp: base},
+		{DeviceID: deviceA.ID, EventType: EventTypeHeartbeat, Timestamp: base.Add(4 * time.Minute)},
+		{DeviceID: deviceB.ID, EventType: EventTypeHeartbeat, Timestamp: base.Add(5 * time.Minute)},
+		{DeviceID: deviceB.ID, EventType: EventTypeHeartbeat, Timestamp: base.Add(10 * time.Minute)},
+	}
+	if err := DB.Create(&events).Error; err != nil {
+		t.Fatalf("failed creating test events: %v", err)
+	}
+
+	outages, err := GetAllOutages(1)
+	if err != nil {
+		t.Fatalf("GetAllOutages failed: %v", err)
+	}
+	if len(outages) != 1 {
+		t.Fatalf("expected limit to return one outage, got %d", len(outages))
+	}
+}
+
+func TestGetEventChartDataAggregatesCounts(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Chart Node", "Ops")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	now := time.Now()
+	events := []Event{
+		{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: now.Add(-20 * time.Minute)},
+		{DeviceID: device.ID, EventType: EventTypeBoot, Timestamp: now.Add(-10 * time.Minute)},
+	}
+	if err := DB.Create(&events).Error; err != nil {
+		t.Fatalf("failed creating chart events: %v", err)
+	}
+
+	buckets, err := GetEventChartData(device.ID, 1, 6)
+	if err != nil {
+		t.Fatalf("GetEventChartData failed: %v", err)
+	}
+	if len(buckets) != 6 {
+		t.Fatalf("expected 6 buckets, got %d", len(buckets))
+	}
+
+	total := 0
+	for _, b := range buckets {
+		total += b.Total
+	}
+	if total < 2 {
+		t.Fatalf("expected chart to include inserted events, total=%d", total)
+	}
+}
