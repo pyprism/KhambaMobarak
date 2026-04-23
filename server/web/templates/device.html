@@ -49,6 +49,45 @@
     </div>
 </div>
 
+<!-- Outage Summary Stats -->
+{{ if .outageStats }}
+<div class="row g-3 mb-4">
+    <div class="col-md-4">
+        <div class="card text-center border-danger h-100">
+            <div class="card-body">
+                <div class="display-6 fw-bold text-danger">{{ .outageStats.TodayCount }}</div>
+                <div class="text-muted small fw-semibold text-uppercase">Outages Today</div>
+                {{ if .outageStats.TodayDowntime }}
+                <div class="text-muted small mt-1"><span data-duration="{{ .outageStats.TodayDowntime.Nanoseconds }}">{{ .outageStats.TodayDowntime }}</span> downtime</div>
+                {{ end }}
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card text-center border-warning h-100">
+            <div class="card-body">
+                <div class="display-6 fw-bold text-warning">{{ .outageStats.MonthCount }}</div>
+                <div class="text-muted small fw-semibold text-uppercase">Outages This Month</div>
+                {{ if .outageStats.MonthDowntime }}
+                <div class="text-muted small mt-1"><span data-duration="{{ .outageStats.MonthDowntime.Nanoseconds }}">{{ .outageStats.MonthDowntime }}</span> downtime</div>
+                {{ end }}
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card text-center border-secondary h-100">
+            <div class="card-body">
+                <div class="display-6 fw-bold text-secondary">{{ .outageStats.YearCount }}</div>
+                <div class="text-muted small fw-semibold text-uppercase">Outages This Year</div>
+                {{ if .outageStats.YearDowntime }}
+                <div class="text-muted small mt-1"><span data-duration="{{ .outageStats.YearDowntime.Nanoseconds }}">{{ .outageStats.YearDowntime }}</span> downtime</div>
+                {{ end }}
+            </div>
+        </div>
+    </div>
+</div>
+{{ end }}
+
 <!-- Activity Chart -->
 <div class="card mb-4">
     <div class="card-header bg-white d-flex justify-content-between align-items-center">
