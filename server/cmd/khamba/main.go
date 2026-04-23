@@ -185,6 +185,27 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	api.RegisterRoutes(r)
 	handlers.RegisterRoutes(r)
 
+	// Start event-retention background worker (delete events older than 7 days).
+	go func() {
+		const retentionDays = 7
+		runCleanup := func() {
+			n, err := models.DeleteOldEvents(retentionDays)
+			if err != nil {
+				fmt.Printf("[retention] failed to delete old events: %v\n", err)
+				return
+			}
+			if n > 0 {
+				fmt.Printf("[retention] deleted %d event(s) older than %d days\n", n, retentionDays)
+			}
+		}
+		runCleanup() // run once at startup
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			runCleanup()
+		}
+	}()
+
 	// Start server
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	fmt.Printf("Khamba Mobarak Power Monitor\n")
