@@ -70,12 +70,14 @@ func deviceDetailHandler(c *gin.Context) {
 	events, _, _ := models.GetDeviceEvents(uint(id), 50, 0)
 	outages, _ := models.GetOutages(uint(id), 20)
 	bootEvents, _ := models.GetBootEvents(uint(id), 10)
+	outageStats, _ := models.GetDeviceOutageStats(uint(id))
 
 	c.HTML(http.StatusOK, "device.html", gin.H{
-		"title":      device.Name + " - Power Monitor",
-		"device":     device,
-		"events":     events,
-		"outages":    outages,
-		"bootEvents": bootEvents,
+		"title":       device.Name + " - Power Monitor",
+		"device":      device,
+		"events":      events,
+		"outages":     outages,
+		"bootEvents":  bootEvents,
+		"outageStats": outageStats,
 	})
 }
