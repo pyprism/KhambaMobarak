@@ -64,6 +64,26 @@ func (d *Device) AfterFind(tx *gorm.DB) error {
 	return nil
 }
 
+// DailyOutageSummary stores aggregated outage counts per device per day.
+// It is updated each time a boot event (power restoration) is recorded.
+type DailyOutageSummary struct {
+	ID            uint      `gorm:"primarykey" json:"id"`
+	DeviceID      uint      `gorm:"uniqueIndex:idx_device_date;not null" json:"device_id"`
+	Date          time.Time `gorm:"uniqueIndex:idx_device_date;not null" json:"date"` // Truncated to midnight UTC
+	OutageCount   int       `gorm:"not null;default:0" json:"outage_count"`
+	TotalDowntime int64     `gorm:"not null;default:0" json:"total_downtime"` // nanoseconds
+}
+
+// OutageStats holds aggregated outage statistics for a device across different time windows.
+type OutageStats struct {
+	TodayCount    int           `json:"today_count"`
+	TodayDowntime time.Duration `json:"today_downtime"`
+	MonthCount    int           `json:"month_count"`
+	MonthDowntime time.Duration `json:"month_downtime"`
+	YearCount     int           `json:"year_count"`
+	YearDowntime  time.Duration `json:"year_downtime"`
+}
+
 // OutageInfo represents information about a power outage
 type OutageInfo struct {
 	DeviceID   uint          `json:"device_id"`
