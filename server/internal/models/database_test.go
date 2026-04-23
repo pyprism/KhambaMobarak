@@ -310,3 +310,194 @@ func TestGetEventChartDataAggregatesCounts(t *testing.T) {
 		t.Fatalf("expected chart to include inserted events, total=%d", total)
 	}
 }
+
+func TestDeleteOldEventsRemovesStaleRows(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Retention Node", "Lab")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	old := time.Now().Add(-40 * 24 * time.Hour)
+	recent := time.Now().Add(-1 * time.Hour)
+
+	events := []Event{
+		{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: old},
+		{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: recent},
+	}
+	if err := DB.Create(&events).Error; err != nil {
+		t.Fatalf("failed to create test events: %v", err)
+	}
+
+	deleted, err := DeleteOldEvents(30)
+	if err != nil {
+		t.Fatalf("DeleteOldEvents failed: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected 1 event deleted, got %d", deleted)
+	}
+
+	remaining, total, err := GetDeviceEvents(device.ID, 10, 0)
+	if err != nil {
+		t.Fatalf("GetDeviceEvents failed: %v", err)
+	}
+	if total != 1 || len(remaining) != 1 {
+		t.Fatalf("expected 1 remaining event, got total=%d len=%d", total, len(remaining))
+	}
+	if !remaining[0].Timestamp.Equal(recent) {
+		t.Fatalf("expected the recent event to remain, got %v", remaining[0].Timestamp)
+	}
+}
+
+func TestUpdateOutageSummaryOnBootRecordsOutage(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Summary Node", "Factory")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	// Simulate: last heartbeat 10 minutes ago, then power restored now.
+	lastHeartbeat := time.Now().Add(-10 * time.Minute)
+	bootTime := time.Now()
+
+	heartbeat := Event{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: lastHeartbeat}
+	if err := DB.Create(&heartbeat).Error; err != nil {
+		t.Fatalf("failed to create heartbeat event: %v", err)
+	}
+
+	if err := UpdateOutageSummaryOnBoot(device.ID, bootTime); err != nil {
+		t.Fatalf("UpdateOutageSummaryOnBoot failed: %v", err)
+	}
+
+	stats, err := GetDeviceOutageStats(device.ID)
+	if err != nil {
+		t.Fatalf("GetDeviceOutageStats failed: %v", err)
+	}
+	if stats.TodayCount != 1 {
+		t.Fatalf("expected TodayCount=1, got %d", stats.TodayCount)
+	}
+	if stats.MonthCount != 1 {
+		t.Fatalf("expected MonthCount=1, got %d", stats.MonthCount)
+	}
+	if stats.YearCount != 1 {
+		t.Fatalf("expected YearCount=1, got %d", stats.YearCount)
+	}
+	if stats.TodayDowntime < 9*time.Minute {
+		t.Fatalf("expected TodayDowntime >= 9min, got %s", stats.TodayDowntime)
+	}
+}
+
+func TestUpdateOutageSummaryOnBootIgnoresSmallGap(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("SmallGap Node", "Lab")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	// Gap of only 30 seconds — not an outage.
+	lastHB := time.Now().Add(-30 * time.Second)
+	bootTime := time.Now()
+
+	hb := Event{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: lastHB}
+	if err := DB.Create(&hb).Error; err != nil {
+		t.Fatalf("failed to create event: %v", err)
+	}
+
+	if err := UpdateOutageSummaryOnBoot(device.ID, bootTime); err != nil {
+		t.Fatalf("UpdateOutageSummaryOnBoot failed: %v", err)
+	}
+
+	stats, err := GetDeviceOutageStats(device.ID)
+	if err != nil {
+		t.Fatalf("GetDeviceOutageStats failed: %v", err)
+	}
+	if stats.TodayCount != 0 {
+		t.Fatalf("expected no outage recorded for small gap, got TodayCount=%d", stats.TodayCount)
+	}
+}
+
+func TestUpdateOutageSummaryOnBootAccumulates(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Accumulate Node", "Rooftop")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	// Two separate outages today.
+	base := time.Now().Add(-60 * time.Minute)
+
+	ev1 := Event{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: base}
+	ev2 := Event{DeviceID: device.ID, EventType: EventTypeBoot, Timestamp: base.Add(10 * time.Minute)}
+	ev3 := Event{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: base.Add(15 * time.Minute)}
+	ev4 := Event{DeviceID: device.ID, EventType: EventTypeBoot, Timestamp: base.Add(30 * time.Minute)}
+
+	for _, e := range []Event{ev1, ev2, ev3, ev4} {
+		if err := DB.Create(&e).Error; err != nil {
+			t.Fatalf("failed to create event: %v", err)
+		}
+	}
+
+	if err := UpdateOutageSummaryOnBoot(device.ID, ev2.Timestamp); err != nil {
+		t.Fatalf("first UpdateOutageSummaryOnBoot failed: %v", err)
+	}
+	if err := UpdateOutageSummaryOnBoot(device.ID, ev4.Timestamp); err != nil {
+		t.Fatalf("second UpdateOutageSummaryOnBoot failed: %v", err)
+	}
+
+	stats, err := GetDeviceOutageStats(device.ID)
+	if err != nil {
+		t.Fatalf("GetDeviceOutageStats failed: %v", err)
+	}
+	if stats.TodayCount != 2 {
+		t.Fatalf("expected TodayCount=2, got %d", stats.TodayCount)
+	}
+}
+
+func TestGetDeviceOutageStatsReturnsZeroWhenNoData(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Zero Node", "Basement")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	stats, err := GetDeviceOutageStats(device.ID)
+	if err != nil {
+		t.Fatalf("GetDeviceOutageStats failed: %v", err)
+	}
+	if stats.TodayCount != 0 || stats.MonthCount != 0 || stats.YearCount != 0 {
+		t.Fatalf("expected zero stats for new device, got %+v", stats)
+	}
+}
+
+func TestRecordBootEventTriggersSummaryUpdate(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("AutoSummary Node", "Field")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	// Insert a heartbeat directly to simulate an outage gap.
+	oldHB := Event{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: time.Now().Add(-15 * time.Minute)}
+	if err := DB.Create(&oldHB).Error; err != nil {
+		t.Fatalf("failed to create heartbeat: %v", err)
+	}
+
+	// Recording a boot event should automatically update the summary.
+	if _, err := RecordEvent(device.ID, EventTypeBoot); err != nil {
+		t.Fatalf("RecordEvent boot failed: %v", err)
+	}
+
+	stats, err := GetDeviceOutageStats(device.ID)
+	if err != nil {
+		t.Fatalf("GetDeviceOutageStats failed: %v", err)
+	}
+	if stats.TodayCount != 1 {
+		t.Fatalf("expected TodayCount=1 after boot event, got %d", stats.TodayCount)
+	}
+}
