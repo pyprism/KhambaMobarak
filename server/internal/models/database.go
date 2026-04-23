@@ -40,7 +40,7 @@ func InitDB(dbPath string) error {
 	db.Exec("PRAGMA busy_timeout=5000;")
 
 	// Auto migrate schemas
-	if err := db.AutoMigrate(&Device{}, &Event{}); err != nil {
+	if err := db.AutoMigrate(&Device{}, &Event{}, &DailyOutageSummary{}); err != nil {
 		return fmt.Errorf("failed to migrate database: %w", err)
 	}
 
@@ -144,6 +144,14 @@ func RecordEvent(deviceID uint, eventType string) (*Event, error) {
 	// Update device's last seen timestamp
 	if err := DB.Model(&Device{}).Where("id = ?", deviceID).Update("last_seen", now).Error; err != nil {
 		return nil, fmt.Errorf("failed to update device last seen: %w", err)
+	}
+
+	// On boot (power restored), update daily outage summary
+	if eventType == EventTypeBoot {
+		if err := UpdateOutageSummaryOnBoot(deviceID, now); err != nil {
+			// Non-fatal: log but don't fail the event recording
+			_ = err
+		}
 	}
 
 	return event, nil
@@ -280,11 +288,15 @@ func GetAllOutages(limit int) ([]OutageInfo, error) {
 }
 
 // ResetAnalyticsData clears derived analytics while keeping device identity/token data.
-// It removes all events and resets last_seen for every device.
+// It removes all events, daily outage summaries, and resets last_seen for every device.
 func ResetAnalyticsData() error {
 	return DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Exec("DELETE FROM events").Error; err != nil {
 			return fmt.Errorf("failed to clear events: %w", err)
+		}
+
+		if err := tx.Exec("DELETE FROM daily_outage_summaries").Error; err != nil {
+			return fmt.Errorf("failed to clear daily outage summaries: %w", err)
 		}
 
 		if err := tx.Model(&Device{}).Where("1 = 1").Update("last_seen", nil).Error; err != nil {
@@ -293,6 +305,101 @@ func ResetAnalyticsData() error {
 
 		return nil
 	})
+}
+
+// DeleteOldEvents removes events older than retentionDays days.
+// Call this periodically (e.g. from a background goroutine) to keep the event table small.
+func DeleteOldEvents(retentionDays int) (int64, error) {
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	result := DB.Where("timestamp < ?", cutoff).Delete(&Event{})
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to delete old events: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+// UpdateOutageSummaryOnBoot is called whenever a boot (power-restored) event is recorded.
+// It looks for the most recent event before bootTime; if the gap exceeds 2 minutes, it
+// records the outage in DailyOutageSummary keyed to the day the outage started.
+func UpdateOutageSummaryOnBoot(deviceID uint, bootTime time.Time) error {
+	var lastEvent Event
+	if err := DB.Where("device_id = ? AND timestamp < ?", deviceID, bootTime).
+		Order("timestamp DESC").First(&lastEvent).Error; err != nil {
+		// No previous event — nothing to record.
+		return nil
+	}
+
+	gap := bootTime.Sub(lastEvent.Timestamp)
+	if gap <= 2*time.Minute {
+		return nil
+	}
+
+	// Attribute the outage to the calendar day it started.
+	loc := lastEvent.Timestamp.Location()
+	startDay := time.Date(lastEvent.Timestamp.Year(), lastEvent.Timestamp.Month(), lastEvent.Timestamp.Day(), 0, 0, 0, 0, loc)
+
+	var summary DailyOutageSummary
+	err := DB.Where("device_id = ? AND date = ?", deviceID, startDay).First(&summary).Error
+	if err != nil {
+		// Create a fresh row.
+		summary = DailyOutageSummary{
+			DeviceID:      deviceID,
+			Date:          startDay,
+			OutageCount:   1,
+			TotalDowntime: int64(gap),
+		}
+		return DB.Create(&summary).Error
+	}
+
+	// Increment existing row.
+	return DB.Model(&summary).Updates(map[string]interface{}{
+		"outage_count":   summary.OutageCount + 1,
+		"total_downtime": summary.TotalDowntime + int64(gap),
+	}).Error
+}
+
+// GetDeviceOutageStats returns aggregated outage counts for today, current month, and current year.
+func GetDeviceOutageStats(deviceID uint) (*OutageStats, error) {
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, now.Location())
+
+	type aggRow struct {
+		OutageCount   int
+		TotalDowntime int64
+	}
+
+	queryRange := func(from time.Time) (aggRow, error) {
+		var row aggRow
+		err := DB.Model(&DailyOutageSummary{}).
+			Select("COALESCE(SUM(outage_count),0) as outage_count, COALESCE(SUM(total_downtime),0) as total_downtime").
+			Where("device_id = ? AND date >= ?", deviceID, from).
+			Scan(&row).Error
+		return row, err
+	}
+
+	todayRow, err := queryRange(todayStart)
+	if err != nil {
+		return nil, err
+	}
+	monthRow, err := queryRange(monthStart)
+	if err != nil {
+		return nil, err
+	}
+	yearRow, err := queryRange(yearStart)
+	if err != nil {
+		return nil, err
+	}
+
+	return &OutageStats{
+		TodayCount:    todayRow.OutageCount,
+		TodayDowntime: time.Duration(todayRow.TotalDowntime),
+		MonthCount:    monthRow.OutageCount,
+		MonthDowntime: time.Duration(monthRow.TotalDowntime),
+		YearCount:     yearRow.OutageCount,
+		YearDowntime:  time.Duration(yearRow.TotalDowntime),
+	}, nil
 }
 
 // ChartBucket holds aggregated event counts for one time bucket
