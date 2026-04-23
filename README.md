@@ -178,7 +178,7 @@ Server (single binary):
 
 ```bash
 cd server
-CGO_ENABLED=1 go build -ldflags="-s -w" -o khamba ./cmd/khamba/
+go build -ldflags="-s -w" -o khamba ./cmd/khamba/
 ```
 
 Client (PlatformIO):
