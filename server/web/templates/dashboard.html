@@ -92,7 +92,7 @@
                                         </span>
                                         {{ if .LastSeen }}
                                         <small class="time-ago" data-time="{{ .LastSeen.Format "2006-01-02T15:04:05Z07:00" }}">
-                                            {{ .LastSeen.Format "Jan 02 15:04" }}
+                                            {{ .LastSeen.Format "Jan 02 3:04 pm" }}
                                         </small>
                                         {{ else }}
                                         <small class="time-ago">Never seen</small>
@@ -136,7 +136,7 @@
                     <div class="mt-1">
                         <small>
                             <i class="bi bi-clock"></i>
-                            Started: <span data-time="{{ .StartTime.Format "2006-01-02T15:04:05Z07:00" }}">{{ .StartTime.Format "Jan 02 15:04" }}</span>
+                            Started: <span data-time="{{ .StartTime.Format "2006-01-02T15:04:05Z07:00" }}">{{ .StartTime.Format "Jan 02 3:04 pm" }}</span>
                         </small>
                     </div>
                     <div>
@@ -165,4 +165,3 @@
 </body>
 </html>
 {{ end }}
-
