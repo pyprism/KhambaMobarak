@@ -10,6 +10,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const recentEventLimit = 20
+
 // RegisterRoutes registers web page routes
 func RegisterRoutes(r *gin.Engine) {
 	// Dashboard
@@ -67,7 +69,7 @@ func deviceDetailHandler(c *gin.Context) {
 		return
 	}
 
-	events, _, _ := models.GetDeviceEvents(uint(id), 50, 0)
+	events, _, _ := models.GetDeviceEvents(uint(id), recentEventLimit, 0)
 	outages, _ := models.GetOutages(uint(id), 20)
 	bootEvents, _ := models.GetBootEvents(uint(id), 10)
 	outageStats, _ := models.GetDeviceOutageStats(uint(id))
