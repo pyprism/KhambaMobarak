@@ -11,18 +11,13 @@ A power outage monitoring system using ESP8266/ESP32 devices and a Go server. Tr
 - CLI: Manage devices, tokens, and install as a systemd user service
 - Bootstrap dashboard: Clean UI for status and outage history
 
+## Screenshot
+
+<div style="text-align:center;"><img src="screenshot.png" alt="screenshot" width="800" style="max-width:100%; height:auto;"></div>
+
 ## Supported Hardware
 
-### ESP8266
-- NodeMCU v2 (`nodemcuv2`)
-- D1 Mini (`d1_mini`)
-- ESP-12E (`esp12e`)
-
-### ESP32
-- ESP32 DevKit (`esp32dev`)
-- ESP32-C3 DevKitM (`esp32-c3-devkitm-1`)
-- ESP32-S2 Saola (`esp32-s2-saola-1`)
-- ESP32-S3 DevKitC (`esp32-s3-devkitc-1`)
+ESP8266 and ESP32
 
 ## Quick Start
 
@@ -131,25 +126,6 @@ Coverage ignore rules are defined in `server/.coveragerc` (used by `make coverag
 
 `install` now accepts the same `--port` and `--db` overrides as `serve`, but it persists them into `~/.config/khamba/config.json` so the generated service can keep using plain `khamba serve`.
 
-## API Endpoints
-
-### Events (ESP clients)
-
-- POST /api/events (requires `Authorization: Bearer <TOKEN>`)
-
-Example payload:
-
-```json
-{"event_type": "boot"}
-```
-
-### Dashboard JSON APIs
-
-- GET /api/devices
-- GET /api/devices/:id
-- GET /api/devices/:id/events
-- GET /api/outages
-- GET /api/stats
 
 ## How it works
 
