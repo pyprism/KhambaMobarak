@@ -311,6 +311,20 @@ func TestGetEventChartDataAggregatesCounts(t *testing.T) {
 	}
 }
 
+func TestChartBucketLabelUses12HourClock(t *testing.T) {
+	timestamp := time.Date(2026, time.May, 14, 15, 4, 0, 0, time.UTC)
+
+	if got := chartBucketLabel(timestamp, 10*time.Minute); got != "3:04 pm" {
+		t.Fatalf("expected minute bucket to use 12-hour time, got %q", got)
+	}
+	if got := chartBucketLabel(timestamp, 2*time.Hour); got != "May 14 3:00 pm" {
+		t.Fatalf("expected hourly bucket to use 12-hour time, got %q", got)
+	}
+	if got := chartBucketLabel(timestamp, 48*time.Hour); got != "May 14" {
+		t.Fatalf("expected multi-day bucket to omit the clock, got %q", got)
+	}
+}
+
 func TestDeleteOldEventsRemovesStaleRows(t *testing.T) {
 	setupTestDB(t)
 
