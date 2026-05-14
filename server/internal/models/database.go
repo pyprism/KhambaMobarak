@@ -430,19 +430,8 @@ func GetEventChartData(deviceID uint, rangeHours int, buckets int) ([]ChartBucke
 		bucketEnd := bucketStart.Add(bucketDur)
 		mid := bucketStart.Add(bucketDur / 2)
 
-		// Choose label format based on bucket duration
-		var label string
-		switch {
-		case bucketDur < time.Hour:
-			label = bucketStart.Format("15:04")
-		case bucketDur < 24*time.Hour:
-			label = bucketStart.Format("Jan 2 15:00")
-		default:
-			label = bucketStart.Format("Jan 2")
-		}
-
 		b := ChartBucket{
-			Label:     label,
+			Label:     chartBucketLabel(bucketStart, bucketDur),
 			Timestamp: mid.UnixMilli(),
 		}
 		for _, e := range events {
@@ -459,4 +448,15 @@ func GetEventChartData(deviceID uint, rangeHours int, buckets int) ([]ChartBucke
 	}
 
 	return result, nil
+}
+
+func chartBucketLabel(bucketStart time.Time, bucketDur time.Duration) string {
+	switch {
+	case bucketDur < time.Hour:
+		return bucketStart.Format("3:04 pm")
+	case bucketDur < 24*time.Hour:
+		return bucketStart.Format("Jan 2 3:00 pm")
+	default:
+		return bucketStart.Format("Jan 2")
+	}
 }
