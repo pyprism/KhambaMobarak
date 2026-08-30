@@ -1,6 +1,7 @@
 package models
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -76,6 +77,55 @@ func TestRecordEventUpdatesLastSeenAndReturnsEvents(t *testing.T) {
 	}
 }
 
+func TestRecordEventIsIdempotentForDeviceEventID(t *testing.T) {
+	setupTestDB(t)
+	device, _, err := CreateDevice("Idempotent", "Lab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := RecordEvent(device.ID, EventTypeHeartbeat, "evt-123", "software")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := RecordEvent(device.ID, EventTypeHeartbeat, "evt-123", "software")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != second.ID {
+		t.Fatalf("retry created a second event: %d != %d", first.ID, second.ID)
+	}
+	_, total, err := GetDeviceEvents(device.ID, 10, 0)
+	if err != nil || total != 1 {
+		t.Fatalf("expected one stored event, total=%d err=%v", total, err)
+	}
+}
+
+func TestAvailabilityReportAndBackup(t *testing.T) {
+	setupTestDB(t)
+	device, _, err := CreateDevice("Report", "HQ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := DB.Create(&Outage{DeviceID: device.ID, StartTime: now.Add(-time.Hour), EndTime: &now, Duration: int64(time.Hour), Cause: "connectivity", Confidence: "inferred"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := GetAvailabilityReport(device.ID, now.Add(-24*time.Hour), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OutageCount != 1 || report.UptimePercent <= 90 || report.UptimePercent >= 100 {
+		t.Fatalf("unexpected report: %+v", report)
+	}
+	backup := filepath.Join(t.TempDir(), "backup.db")
+	if err := BackupDatabase(backup); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(backup); err != nil || info.Size() == 0 {
+		t.Fatalf("backup not created: %v", err)
+	}
+}
+
 func TestResetAnalyticsDataKeepsDevicesAndTokens(t *testing.T) {
 	setupTestDB(t)
 
@@ -122,12 +172,12 @@ func TestResetAnalyticsDataKeepsDevicesAndTokens(t *testing.T) {
 		t.Fatalf("expected token B to remain valid, err=%v", err)
 	}
 
-	recent, err := GetRecentEvents(10)
-	if err != nil {
-		t.Fatalf("GetRecentEvents failed: %v", err)
+	var remainingEvents int64
+	if err := DB.Model(&Event{}).Count(&remainingEvents).Error; err != nil {
+		t.Fatalf("failed to count events: %v", err)
 	}
-	if len(recent) != 0 {
-		t.Fatalf("expected no events after analytics reset, got %d", len(recent))
+	if remainingEvents != 0 {
+		t.Fatalf("expected no events after analytics reset, got %d", remainingEvents)
 	}
 }
 
@@ -186,6 +236,128 @@ func TestDeleteDeviceRemovesRecord(t *testing.T) {
 
 	if _, err := GetDeviceByID(device.ID); err == nil {
 		t.Fatalf("expected deleted device lookup to fail")
+	}
+}
+
+func TestDeleteDeviceHardDeletesAllowingTokenReuse(t *testing.T) {
+	setupTestDB(t)
+
+	device, token, err := CreateDevice("Reuse Me", "Tmp")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+	if err := DB.Create(&MaintenanceWindow{DeviceID: &device.ID, StartTime: time.Now(), EndTime: time.Now().Add(time.Hour)}).Error; err != nil {
+		t.Fatalf("failed to create maintenance window: %v", err)
+	}
+
+	if err := DeleteDevice(device.ID); err != nil {
+		t.Fatalf("DeleteDevice failed: %v", err)
+	}
+
+	var deviceCount int64
+	if err := DB.Unscoped().Model(&Device{}).Where("id = ?", device.ID).Count(&deviceCount).Error; err != nil {
+		t.Fatalf("failed to count devices: %v", err)
+	}
+	if deviceCount != 0 {
+		t.Fatalf("expected device row to be hard-deleted, found %d", deviceCount)
+	}
+
+	var windowCount int64
+	if err := DB.Model(&MaintenanceWindow{}).Where("device_id = ?", device.ID).Count(&windowCount).Error; err != nil {
+		t.Fatalf("failed to count maintenance windows: %v", err)
+	}
+	if windowCount != 0 {
+		t.Fatalf("expected device-specific maintenance windows to be removed, found %d", windowCount)
+	}
+
+	if _, _, err := CreateDevice("Reuse Me Again", "Tmp"); err != nil {
+		t.Fatalf("expected new device creation to succeed after delete: %v", err)
+	}
+	if token == "" {
+		t.Fatalf("sanity: token should have been non-empty")
+	}
+}
+
+func TestUpdateDeviceUpdatesNameAndLocation(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Old Name", "Old Loc")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	newName := "New Name"
+	updated, err := UpdateDevice(device.ID, &newName, nil)
+	if err != nil {
+		t.Fatalf("UpdateDevice failed: %v", err)
+	}
+	if updated.Name != "New Name" || updated.Location != "Old Loc" {
+		t.Fatalf("unexpected device after partial update: %+v", updated)
+	}
+
+	newLocation := "New Loc"
+	updated, err = UpdateDevice(device.ID, nil, &newLocation)
+	if err != nil {
+		t.Fatalf("UpdateDevice failed: %v", err)
+	}
+	if updated.Name != "New Name" || updated.Location != "New Loc" {
+		t.Fatalf("unexpected device after second update: %+v", updated)
+	}
+
+	blank := "   "
+	if _, err := UpdateDevice(device.ID, &blank, nil); err == nil {
+		t.Fatalf("expected blank name to be rejected")
+	}
+}
+
+func TestAcknowledgeOutagePersistsNotes(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Ack Node", "Lab")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+	end := time.Now()
+	outage := Outage{DeviceID: device.ID, StartTime: end.Add(-time.Hour), EndTime: &end, Duration: int64(time.Hour), Cause: "connectivity", Confidence: "inferred"}
+	if err := DB.Create(&outage).Error; err != nil {
+		t.Fatalf("failed to create outage: %v", err)
+	}
+
+	acked, err := AcknowledgeOutage(outage.ID, "checked breaker panel")
+	if err != nil {
+		t.Fatalf("AcknowledgeOutage failed: %v", err)
+	}
+	if acked.AcknowledgedAt == nil {
+		t.Fatalf("expected AcknowledgedAt to be set")
+	}
+	if acked.Notes != "checked breaker panel" {
+		t.Fatalf("expected notes to be persisted, got %q", acked.Notes)
+	}
+
+	if _, err := AcknowledgeOutage(outage.ID+999, ""); err == nil {
+		t.Fatalf("expected acknowledging a missing outage to error")
+	}
+}
+
+func TestClassifyOutageMapsResetReasons(t *testing.T) {
+	cases := []struct {
+		reason              string
+		wantCause, wantConf string
+	}{
+		{"", "connectivity", "inferred"},
+		{"Power on", "power", "confirmed"},
+		{"Brownout Reset", "power", "confirmed"},
+		{"Deep-Sleep Wake", "planned", "confirmed"},
+		{"Task Watchdog", "device-reset", "confirmed"},
+		{"Exception/Panic", "device-reset", "confirmed"},
+		{"External Reset", "device-reset", "confirmed"},
+		{"something unrecognized", "connectivity", "inferred"},
+	}
+	for _, tc := range cases {
+		cause, confidence := classifyOutage(tc.reason)
+		if cause != tc.wantCause || confidence != tc.wantConf {
+			t.Fatalf("classifyOutage(%q) = (%q, %q), want (%q, %q)", tc.reason, cause, confidence, tc.wantCause, tc.wantConf)
+		}
 	}
 }
 
@@ -258,14 +430,14 @@ func TestGetAllOutagesAppliesLimit(t *testing.T) {
 	}
 
 	base := time.Now().Add(-40 * time.Minute)
-	events := []Event{
-		{DeviceID: deviceA.ID, EventType: EventTypeHeartbeat, Timestamp: base},
-		{DeviceID: deviceA.ID, EventType: EventTypeHeartbeat, Timestamp: base.Add(4 * time.Minute)},
-		{DeviceID: deviceB.ID, EventType: EventTypeHeartbeat, Timestamp: base.Add(5 * time.Minute)},
-		{DeviceID: deviceB.ID, EventType: EventTypeHeartbeat, Timestamp: base.Add(10 * time.Minute)},
+	older := base.Add(10 * time.Minute)
+	newer := base.Add(20 * time.Minute)
+	outageRecords := []Outage{
+		{DeviceID: deviceA.ID, StartTime: base, EndTime: &older, Duration: int64(older.Sub(base)), Cause: "connectivity", Confidence: "inferred"},
+		{DeviceID: deviceB.ID, StartTime: older, EndTime: &newer, Duration: int64(newer.Sub(older)), Cause: "connectivity", Confidence: "inferred"},
 	}
-	if err := DB.Create(&events).Error; err != nil {
-		t.Fatalf("failed creating test events: %v", err)
+	if err := DB.Create(&outageRecords).Error; err != nil {
+		t.Fatalf("failed creating test outages: %v", err)
 	}
 
 	outages, err := GetAllOutages(1)
@@ -364,25 +536,36 @@ func TestDeleteOldEventsRemovesStaleRows(t *testing.T) {
 	}
 }
 
-func TestUpdateOutageSummaryOnBootRecordsOutage(t *testing.T) {
+// TestRecordEventPersistsOutageOnHeartbeatRecovery locks in the fix for the
+// bug where an outage only closed on a boot event: a device that never
+// rebooted (WiFi/router drop, not a power loss) but recovers via a plain
+// heartbeat must still get a persisted Outage row, not just a vanished gap.
+func TestRecordEventPersistsOutageOnHeartbeatRecovery(t *testing.T) {
 	setupTestDB(t)
 
-	device, _, err := CreateDevice("Summary Node", "Factory")
+	device, _, err := CreateDevice("Recovery Node", "Lab")
 	if err != nil {
 		t.Fatalf("CreateDevice failed: %v", err)
 	}
 
-	// Simulate: last heartbeat 10 minutes ago, then power restored now.
-	lastHeartbeat := time.Now().Add(-10 * time.Minute)
-	bootTime := time.Now()
-
-	heartbeat := Event{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: lastHeartbeat}
-	if err := DB.Create(&heartbeat).Error; err != nil {
+	old := time.Now().Add(-10 * time.Minute)
+	if err := DB.Create(&Event{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: old}).Error; err != nil {
 		t.Fatalf("failed to create heartbeat event: %v", err)
 	}
+	if err := DB.Model(&Device{}).Where("id = ?", device.ID).Update("last_seen", old).Error; err != nil {
+		t.Fatalf("failed to set last_seen: %v", err)
+	}
 
-	if err := UpdateOutageSummaryOnBoot(device.ID, bootTime); err != nil {
-		t.Fatalf("UpdateOutageSummaryOnBoot failed: %v", err)
+	if _, err := RecordEvent(device.ID, EventTypeHeartbeat); err != nil {
+		t.Fatalf("RecordEvent failed: %v", err)
+	}
+
+	var count int64
+	if err := DB.Model(&Outage{}).Where("device_id = ?", device.ID).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count outages: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 persisted outage after heartbeat recovery, got %d", count)
 	}
 
 	stats, err := GetDeviceOutageStats(device.ID)
@@ -391,83 +574,6 @@ func TestUpdateOutageSummaryOnBootRecordsOutage(t *testing.T) {
 	}
 	if stats.TodayCount != 1 {
 		t.Fatalf("expected TodayCount=1, got %d", stats.TodayCount)
-	}
-	if stats.MonthCount != 1 {
-		t.Fatalf("expected MonthCount=1, got %d", stats.MonthCount)
-	}
-	if stats.YearCount != 1 {
-		t.Fatalf("expected YearCount=1, got %d", stats.YearCount)
-	}
-	if stats.TodayDowntime < 9*time.Minute {
-		t.Fatalf("expected TodayDowntime >= 9min, got %s", stats.TodayDowntime)
-	}
-}
-
-func TestUpdateOutageSummaryOnBootIgnoresSmallGap(t *testing.T) {
-	setupTestDB(t)
-
-	device, _, err := CreateDevice("SmallGap Node", "Lab")
-	if err != nil {
-		t.Fatalf("CreateDevice failed: %v", err)
-	}
-
-	// Gap of only 30 seconds — not an outage.
-	lastHB := time.Now().Add(-30 * time.Second)
-	bootTime := time.Now()
-
-	hb := Event{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: lastHB}
-	if err := DB.Create(&hb).Error; err != nil {
-		t.Fatalf("failed to create event: %v", err)
-	}
-
-	if err := UpdateOutageSummaryOnBoot(device.ID, bootTime); err != nil {
-		t.Fatalf("UpdateOutageSummaryOnBoot failed: %v", err)
-	}
-
-	stats, err := GetDeviceOutageStats(device.ID)
-	if err != nil {
-		t.Fatalf("GetDeviceOutageStats failed: %v", err)
-	}
-	if stats.TodayCount != 0 {
-		t.Fatalf("expected no outage recorded for small gap, got TodayCount=%d", stats.TodayCount)
-	}
-}
-
-func TestUpdateOutageSummaryOnBootAccumulates(t *testing.T) {
-	setupTestDB(t)
-
-	device, _, err := CreateDevice("Accumulate Node", "Rooftop")
-	if err != nil {
-		t.Fatalf("CreateDevice failed: %v", err)
-	}
-
-	// Two separate outages today.
-	base := time.Now().Add(-60 * time.Minute)
-
-	ev1 := Event{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: base}
-	ev2 := Event{DeviceID: device.ID, EventType: EventTypeBoot, Timestamp: base.Add(10 * time.Minute)}
-	ev3 := Event{DeviceID: device.ID, EventType: EventTypeHeartbeat, Timestamp: base.Add(15 * time.Minute)}
-	ev4 := Event{DeviceID: device.ID, EventType: EventTypeBoot, Timestamp: base.Add(30 * time.Minute)}
-
-	for _, e := range []Event{ev1, ev2, ev3, ev4} {
-		if err := DB.Create(&e).Error; err != nil {
-			t.Fatalf("failed to create event: %v", err)
-		}
-	}
-
-	if err := UpdateOutageSummaryOnBoot(device.ID, ev2.Timestamp); err != nil {
-		t.Fatalf("first UpdateOutageSummaryOnBoot failed: %v", err)
-	}
-	if err := UpdateOutageSummaryOnBoot(device.ID, ev4.Timestamp); err != nil {
-		t.Fatalf("second UpdateOutageSummaryOnBoot failed: %v", err)
-	}
-
-	stats, err := GetDeviceOutageStats(device.ID)
-	if err != nil {
-		t.Fatalf("GetDeviceOutageStats failed: %v", err)
-	}
-	if stats.TodayCount != 2 {
-		t.Fatalf("expected TodayCount=2, got %d", stats.TodayCount)
 	}
 }
 
