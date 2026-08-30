@@ -645,19 +645,48 @@ func GetAvailabilityReport(deviceID uint, from, to time.Time) (*AvailabilityRepo
 	if err != nil {
 		return nil, err
 	}
-	var row struct {
-		Count    int64
-		Duration int64
-	}
-	if err := DB.Model(&Outage{}).Select("COUNT(*) AS count, COALESCE(SUM(duration), 0) AS duration").Where("device_id = ? AND start_time < ? AND (end_time IS NULL OR end_time > ?) AND suppressed = ?", deviceID, to, from, false).Scan(&row).Error; err != nil {
+	var outages []Outage
+	if err := DB.Where("device_id = ? AND start_time < ? AND (end_time IS NULL OR end_time > ?) AND suppressed = ?", deviceID, to, from, false).Find(&outages).Error; err != nil {
 		return nil, err
 	}
+
+	now := time.Now()
+	if device.LastSeen != nil && now.Sub(*device.LastSeen) > OfflineThreshold {
+		// The device is offline right now and hasn't recovered yet, so
+		// RecordEvent hasn't (and can't yet) written an Outage row for this
+		// gap. Derive it so an ongoing outage isn't reported as 100% uptime.
+		suppressed, err := IsMaintenanceActive(DB, deviceID, *device.LastSeen, now)
+		if err != nil {
+			return nil, err
+		}
+		if !suppressed && device.LastSeen.Before(to) && now.After(from) {
+			outages = append(outages, Outage{DeviceID: deviceID, StartTime: *device.LastSeen, EndTime: &now})
+		}
+	}
+
+	var count int64
+	var downtime time.Duration
+	for _, o := range outages {
+		end := to
+		if o.EndTime != nil && o.EndTime.Before(to) {
+			end = *o.EndTime
+		}
+		start := from
+		if o.StartTime.After(from) {
+			start = o.StartTime
+		}
+		if overlap := end.Sub(start); overlap > 0 {
+			downtime += overlap
+			count++
+		}
+	}
+
 	total := to.Sub(from)
 	uptime := 100.0
 	if total > 0 {
-		uptime = 100 * float64(maxDuration(0, total-time.Duration(row.Duration))) / float64(total)
+		uptime = 100 * float64(maxDuration(0, total-downtime)) / float64(total)
 	}
-	return &AvailabilityReport{Device: *device, From: from, To: to, OutageCount: row.Count, Downtime: time.Duration(row.Duration), UptimePercent: uptime}, nil
+	return &AvailabilityReport{Device: *device, From: from, To: to, OutageCount: count, Downtime: downtime, UptimePercent: uptime}, nil
 }
 func maxDuration(a, b time.Duration) time.Duration {
 	if a > b {
@@ -684,7 +713,10 @@ func GetEventChartData(deviceID uint, rangeHours int, buckets int) ([]ChartBucke
 
 	rawFrom := from
 	if rangeHours > 7*24 {
-		rawFrom = now.AddDate(0, 0, -7)
+		// Align to a day boundary so this cutoff matches the day-truncated
+		// rollup dates below; otherwise the boundary day's events get
+		// counted twice (once via its rollup, once via raw rows).
+		rawFrom = dayBucket(now.AddDate(0, 0, -7))
 	}
 	var events []Event
 	if err := DB.Where("device_id = ? AND timestamp >= ?", deviceID, rawFrom).Order("timestamp ASC").Find(&events).Error; err != nil {
