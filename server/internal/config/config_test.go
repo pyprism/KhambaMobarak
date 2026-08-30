@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestGetConfigDirUsesXDGConfigHome(t *testing.T) {
@@ -59,7 +60,7 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", xdgConfig)
 	t.Setenv("XDG_DATA_HOME", xdgData)
 
-	cfg := &Config{Port: 9090, DBPath: filepath.Join(xdgData, "custom.db")}
+	cfg := &Config{Port: 9090, DBPath: filepath.Join(xdgData, "custom.db"), OfflineThresholdSeconds: DefaultOfflineThresholdSeconds, RetentionDays: DefaultRetentionDays}
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save failed: %v", err)
 	}
@@ -94,5 +95,39 @@ func TestEnsureDirectoriesCreatesConfigAndDataDirs(t *testing.T) {
 	}
 	if _, err := os.Stat(dataDir); err != nil {
 		t.Fatalf("expected data dir to exist: %v", err)
+	}
+}
+
+func TestValidateRejectsInvalidConfiguration(t *testing.T) {
+	valid := Config{Port: 8080, DBPath: "data.db", OfflineThresholdSeconds: DefaultOfflineThresholdSeconds, RetentionDays: DefaultRetentionDays}
+	invalidCases := []Config{valid, valid, valid, valid, valid}
+	invalidCases[0].Port = 0
+	invalidCases[1].Port = 65536
+	invalidCases[2].DBPath = ""
+	invalidCases[3].OfflineThresholdSeconds = 0
+	invalidCases[4].RetentionDays = -1
+	for _, cfg := range invalidCases {
+		cfg := cfg
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("expected invalid config %+v to be rejected", cfg)
+		}
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("expected valid config: %v", err)
+	}
+}
+
+func TestLocationDefaultsToUTC(t *testing.T) {
+	cfg := &Config{DisplayTimezone: ""}
+	if cfg.Location() != time.UTC {
+		t.Fatalf("expected empty timezone to resolve to UTC")
+	}
+	cfg.DisplayTimezone = "not-a-real-timezone"
+	if cfg.Location() != time.UTC {
+		t.Fatalf("expected invalid timezone to fall back to UTC")
+	}
+	cfg.DisplayTimezone = "America/New_York"
+	if cfg.Location().String() != "America/New_York" {
+		t.Fatalf("expected named timezone to resolve, got %v", cfg.Location())
 	}
 }
