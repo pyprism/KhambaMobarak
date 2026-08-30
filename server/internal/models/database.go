@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -36,15 +38,40 @@ func InitDB(dbPath string) error {
 	}
 
 	// Enable WAL mode for better concurrency
-	db.Exec("PRAGMA journal_mode=WAL;")
-	db.Exec("PRAGMA busy_timeout=5000;")
+	if err := db.Exec("PRAGMA journal_mode=WAL;").Error; err != nil {
+		return fmt.Errorf("failed to enable WAL: %w", err)
+	}
+	if err := db.Exec("PRAGMA busy_timeout=5000;").Error; err != nil {
+		return fmt.Errorf("failed to set busy timeout: %w", err)
+	}
 
 	// Auto migrate schemas
-	if err := db.AutoMigrate(&Device{}, &Event{}, &DailyOutageSummary{}); err != nil {
+	if err := db.AutoMigrate(&Device{}, &Event{}, &DailyOutageSummary{}, &Outage{}, &DailyEventRollup{}, &MaintenanceWindow{}); err != nil {
 		return fmt.Errorf("failed to migrate database: %w", err)
+	}
+	if err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_device_event_id_nonempty ON events(device_id, event_id) WHERE event_id <> ''").Error; err != nil {
+		return fmt.Errorf("failed to create event id index: %w", err)
+	}
+	if err := db.Exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at DATETIME NOT NULL)").Error; err != nil {
+		return fmt.Errorf("failed to create migration ledger: %w", err)
+	}
+	if err := db.Exec("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, CURRENT_TIMESTAMP)").Error; err != nil {
+		return fmt.Errorf("failed to record schema version: %w", err)
 	}
 
 	DB = db
+	return nil
+}
+
+// BackupDatabase creates a SQLite-consistent snapshot, including WAL content.
+func BackupDatabase(destination string) error {
+	if strings.TrimSpace(destination) == "" {
+		return errors.New("backup path cannot be empty")
+	}
+	escaped := strings.ReplaceAll(destination, "'", "''")
+	if err := DB.Exec("VACUUM INTO '" + escaped + "'").Error; err != nil {
+		return fmt.Errorf("failed to create backup: %w", err)
+	}
 	return nil
 }
 
@@ -122,39 +149,212 @@ func GetOrCreateDeviceByName(name, location string) (*Device, string, bool, erro
 	return createdDevice, token, true, nil
 }
 
-// DeleteDevice deletes a device by ID
+// DeleteDevice deletes a device by ID, along with all of its events,
+// summaries, outages, and device-specific maintenance windows. The device
+// row itself is hard-deleted so its token can be reused.
 func DeleteDevice(id uint) error {
-	return DB.Delete(&Device{}, id).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&Event{}, "device_id = ?", id).Error; err != nil {
+			return err
+		}
+		if err := tx.Delete(&DailyOutageSummary{}, "device_id = ?", id).Error; err != nil {
+			return err
+		}
+		if err := tx.Delete(&DailyEventRollup{}, "device_id = ?", id).Error; err != nil {
+			return err
+		}
+		if err := tx.Delete(&Outage{}, "device_id = ?", id).Error; err != nil {
+			return err
+		}
+		if err := tx.Delete(&MaintenanceWindow{}, "device_id = ?", id).Error; err != nil {
+			return err
+		}
+		return tx.Unscoped().Delete(&Device{}, id).Error
+	})
+}
+
+// UpdateDevice updates the name and/or location of a device. Passing nil for
+// a field leaves it unchanged.
+func UpdateDevice(id uint, name, location *string) (*Device, error) {
+	updates := map[string]interface{}{}
+	if name != nil {
+		trimmed := strings.TrimSpace(*name)
+		if trimmed == "" {
+			return nil, errors.New("name cannot be empty")
+		}
+		updates["name"] = trimmed
+	}
+	if location != nil {
+		updates["location"] = *location
+	}
+	if len(updates) > 0 {
+		if err := DB.Model(&Device{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+			return nil, fmt.Errorf("failed to update device: %w", err)
+		}
+	}
+	return GetDeviceByID(id)
 }
 
 // RecordEvent records a new event for a device
-func RecordEvent(deviceID uint, eventType string) (*Event, error) {
+func RecordEvent(deviceID uint, eventType string, metadata ...string) (*Event, error) {
 	now := time.Now()
-
-	event := &Event{
-		DeviceID:  deviceID,
-		EventType: eventType,
-		Timestamp: now,
+	eventID, resetReason := "", ""
+	if len(metadata) > 0 {
+		eventID = metadata[0]
 	}
-
-	if err := DB.Create(event).Error; err != nil {
+	if len(metadata) > 1 {
+		resetReason = metadata[1]
+	}
+	if eventID == "" {
+		eventID = fmt.Sprintf("server-%d", now.UnixNano())
+	}
+	event := &Event{DeviceID: deviceID, EventID: eventID, EventType: eventType, Timestamp: now, ResetReason: resetReason}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if eventID != "" {
+			var existing Event
+			err := tx.Where("device_id = ? AND event_id = ?", deviceID, eventID).First(&existing).Error
+			if err == nil {
+				*event = existing
+				return nil
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+		}
+		var device Device
+		if err := tx.First(&device, deviceID).Error; err != nil {
+			return err
+		}
+		// Copy the value rather than aliasing device.LastSeen: GORM's Update
+		// below mutates the pointee of an existing pointer field in place, so
+		// holding onto the pointer itself would silently turn "previous" into
+		// "now" before the gap comparison runs.
+		var previous *time.Time
+		if device.LastSeen != nil {
+			t := *device.LastSeen
+			previous = &t
+		} else {
+			var last Event
+			if err := tx.Where("device_id = ?", deviceID).Order("timestamp DESC").First(&last).Error; err == nil {
+				previous = &last.Timestamp
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+		}
+		if err := tx.Create(event).Error; err != nil {
+			if eventID != "" && isUniqueConstraintErr(err) {
+				// Lost a race with a concurrent retry of the same event; treat as a
+				// successful dedupe instead of surfacing a 500.
+				var existing Event
+				if lookupErr := tx.Where("device_id = ? AND event_id = ?", deviceID, eventID).First(&existing).Error; lookupErr == nil {
+					*event = existing
+					return nil
+				}
+			}
+			return err
+		}
+		if err := tx.Model(&device).Update("last_seen", now).Error; err != nil {
+			return err
+		}
+		if err := updateDailyRollup(tx, deviceID, now, eventType); err != nil {
+			return err
+		}
+		if previous != nil && now.Sub(*previous) > OfflineThreshold {
+			// A reset reason only speaks to *this* event; it's only trustworthy
+			// evidence of what caused the gap when the device actually rebooted
+			// to send it. A heartbeat-only recovery means the device never
+			// restarted, so the gap is a connectivity interruption, full stop.
+			outageResetReason := ""
+			if eventType == EventTypeBoot {
+				outageResetReason = resetReason
+			}
+			if err := createOutage(tx, deviceID, *previous, now, outageResetReason); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, fmt.Errorf("failed to record event: %w", err)
 	}
-
-	// Update device's last seen timestamp
-	if err := DB.Model(&Device{}).Where("id = ?", deviceID).Update("last_seen", now).Error; err != nil {
-		return nil, fmt.Errorf("failed to update device last seen: %w", err)
-	}
-
-	// On boot (power restored), update daily outage summary
-	if eventType == EventTypeBoot {
-		if err := UpdateOutageSummaryOnBoot(deviceID, now); err != nil {
-			// Non-fatal: log but don't fail the event recording
-			_ = err
-		}
-	}
-
 	return event, nil
+}
+
+// isUniqueConstraintErr reports whether err came from a SQLite UNIQUE
+// constraint violation (e.g. a racing insert of the same device/event_id).
+func isUniqueConstraintErr(err error) bool {
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// dayBucket truncates t to midnight in DisplayLocation.
+func dayBucket(t time.Time) time.Time {
+	t = t.In(DisplayLocation)
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, DisplayLocation)
+}
+
+// classifyOutage infers an outage's cause/confidence from the device's
+// self-reported reset reason. An empty reason (heartbeat-only recovery, or
+// firmware that doesn't report one) always yields the conservative default.
+func classifyOutage(resetReason string) (cause, confidence string) {
+	r := strings.ToLower(resetReason)
+	switch {
+	case r == "":
+		return "connectivity", "inferred"
+	case strings.Contains(r, "brownout"), strings.Contains(r, "power"):
+		return "power", "confirmed"
+	case strings.Contains(r, "deep-sleep"), strings.Contains(r, "deep sleep"):
+		return "planned", "confirmed"
+	case strings.Contains(r, "watchdog"), strings.Contains(r, "panic"),
+		strings.Contains(r, "exception"), strings.Contains(r, "software"),
+		strings.Contains(r, "fatal"), strings.Contains(r, "external"):
+		return "device-reset", "confirmed"
+	default:
+		return "connectivity", "inferred"
+	}
+}
+
+func updateDailyRollup(tx *gorm.DB, deviceID uint, now time.Time, eventType string) error {
+	day := dayBucket(now)
+	var rollup DailyEventRollup
+	err := tx.Where("device_id = ? AND date = ?", deviceID, day).First(&rollup).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		rollup = DailyEventRollup{DeviceID: deviceID, Date: day}
+		if eventType == EventTypeBoot {
+			rollup.Boots = 1
+		} else {
+			rollup.Heartbeats = 1
+		}
+		return tx.Create(&rollup).Error
+	}
+	if err != nil {
+		return err
+	}
+	if eventType == EventTypeBoot {
+		return tx.Model(&rollup).Update("boots", rollup.Boots+1).Error
+	}
+	return tx.Model(&rollup).Update("heartbeats", rollup.Heartbeats+1).Error
+}
+
+func createOutage(tx *gorm.DB, deviceID uint, start, end time.Time, resetReason string) error {
+	suppressed, err := IsMaintenanceActive(tx, deviceID, start, end)
+	if err != nil {
+		return err
+	}
+	cause, confidence := classifyOutage(resetReason)
+	outage := Outage{DeviceID: deviceID, StartTime: start, EndTime: &end, Duration: int64(end.Sub(start)), Cause: cause, Confidence: confidence, Suppressed: suppressed}
+	if err := tx.Create(&outage).Error; err != nil {
+		return err
+	}
+	day := dayBucket(start)
+	var summary DailyOutageSummary
+	err = tx.Where("device_id = ? AND date = ?", deviceID, day).First(&summary).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return tx.Create(&DailyOutageSummary{DeviceID: deviceID, Date: day, OutageCount: 1, TotalDowntime: outage.Duration}).Error
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Model(&summary).Updates(map[string]interface{}{"outage_count": summary.OutageCount + 1, "total_downtime": summary.TotalDowntime + outage.Duration}).Error
 }
 
 // GetDeviceEvents retrieves events for a device with pagination
@@ -175,15 +375,6 @@ func GetDeviceEvents(deviceID uint, limit, offset int) ([]Event, int64, error) {
 	return events, total, nil
 }
 
-// GetRecentEvents retrieves recent events across all devices
-func GetRecentEvents(limit int) ([]Event, error) {
-	var events []Event
-	if err := DB.Order("timestamp DESC").Limit(limit).Find(&events).Error; err != nil {
-		return nil, err
-	}
-	return events, nil
-}
-
 // GetBootEvents retrieves boot events (power restorations) for a device
 func GetBootEvents(deviceID uint, limit int) ([]Event, error) {
 	var events []Event
@@ -196,55 +387,62 @@ func GetBootEvents(deviceID uint, limit int) ([]Event, error) {
 	return events, nil
 }
 
-// GetOutages calculates outage periods for a device
-// An outage is detected when there's a gap > 2 minutes between events
-func GetOutages(deviceID uint, limit int) ([]OutageInfo, error) {
-	var events []Event
-	if err := DB.Where("device_id = ?", deviceID).
-		Order("timestamp ASC").
-		Find(&events).Error; err != nil {
+// ongoingOutageInfos derives OutageInfo entries for devices that are
+// currently offline. These have no persisted Outage row yet (RecordEvent
+// only creates one once the device recovers), so they're computed from
+// Device.LastSeen. Pass deviceID to scope to one device, or nil for all.
+func ongoingOutageInfos(deviceID *uint) ([]OutageInfo, error) {
+	cutoff := time.Now().Add(-OfflineThreshold)
+	q := DB.Where("last_seen IS NOT NULL AND last_seen < ?", cutoff)
+	if deviceID != nil {
+		q = q.Where("id = ?", *deviceID)
+	}
+	var devices []Device
+	if err := q.Find(&devices).Error; err != nil {
 		return nil, err
 	}
+	infos := make([]OutageInfo, 0, len(devices))
+	for _, d := range devices {
+		infos = append(infos, OutageInfo{DeviceID: d.ID, DeviceName: d.Name, Location: d.Location, StartTime: *d.LastSeen, Duration: time.Since(*d.LastSeen), IsOngoing: true, Cause: "connectivity", Confidence: "inferred"})
+	}
+	return infos, nil
+}
 
+// GetOutages returns outage periods for a device, most recent first.
+func GetOutages(deviceID uint, limit int) ([]OutageInfo, error) {
 	device, err := GetDeviceByID(deviceID)
 	if err != nil {
 		return nil, err
 	}
-
-	var outages []OutageInfo
-	threshold := 2 * time.Minute
-
-	for i := 1; i < len(events); i++ {
-		gap := events[i].Timestamp.Sub(events[i-1].Timestamp)
-		if gap > threshold {
-			outage := OutageInfo{
-				DeviceID:   deviceID,
-				DeviceName: device.Name,
-				Location:   device.Location,
-				StartTime:  events[i-1].Timestamp,
-				EndTime:    &events[i].Timestamp,
-				Duration:   gap,
-				IsOngoing:  false,
+	var records []Outage
+	if err := DB.Where("device_id = ?", deviceID).Order("start_time DESC").Find(&records).Error; err != nil {
+		return nil, err
+	}
+	outages := make([]OutageInfo, 0, len(records)+1)
+	for _, record := range records {
+		outages = append(outages, OutageInfo{ID: record.ID, DeviceID: deviceID, DeviceName: device.Name, Location: device.Location, StartTime: record.StartTime, EndTime: record.EndTime, Duration: time.Duration(record.Duration), Cause: record.Cause, Confidence: record.Confidence, Suppressed: record.Suppressed, AcknowledgedAt: record.AcknowledgedAt, Notes: record.Notes})
+	}
+	// Compatibility for databases populated before outage records were introduced.
+	// New writes never need this path because RecordEvent persists the incident.
+	if len(records) == 0 {
+		var events []Event
+		if err := DB.Where("device_id = ?", deviceID).Order("timestamp ASC").Find(&events).Error; err != nil {
+			return nil, err
+		}
+		for i := 1; i < len(events); i++ {
+			gap := events[i].Timestamp.Sub(events[i-1].Timestamp)
+			if gap > OfflineThreshold {
+				end := events[i].Timestamp
+				outages = append(outages, OutageInfo{DeviceID: deviceID, DeviceName: device.Name, Location: device.Location, StartTime: events[i-1].Timestamp, EndTime: &end, Duration: gap, Cause: "connectivity", Confidence: "inferred"})
 			}
-			outages = append([]OutageInfo{outage}, outages...) // Prepend for reverse order
 		}
 	}
-
-	// Check for ongoing outage
-	if len(events) > 0 {
-		lastEvent := events[len(events)-1]
-		if time.Since(lastEvent.Timestamp) > threshold {
-			outage := OutageInfo{
-				DeviceID:   deviceID,
-				DeviceName: device.Name,
-				Location:   device.Location,
-				StartTime:  lastEvent.Timestamp,
-				Duration:   time.Since(lastEvent.Timestamp),
-				IsOngoing:  true,
-			}
-			outages = append([]OutageInfo{outage}, outages...)
-		}
+	ongoing, err := ongoingOutageInfos(&deviceID)
+	if err != nil {
+		return nil, err
 	}
+	outages = append(outages, ongoing...)
+	sort.Slice(outages, func(i, j int) bool { return outages[i].StartTime.After(outages[j].StartTime) })
 
 	// Apply limit
 	if limit > 0 && len(outages) > limit {
@@ -254,37 +452,101 @@ func GetOutages(deviceID uint, limit int) ([]OutageInfo, error) {
 	return outages, nil
 }
 
-// GetAllOutages retrieves recent outages across all devices
+// GetAllOutages retrieves recent outages across all devices. Persisted
+// outages are limited and ordered in SQL rather than loading every device's
+// full history into Go; only the legacy pre-outage-table fallback (see
+// GetOutages) is skipped here since it applies to at most a handful of
+// devices from before this table existed and is still reachable per-device.
 func GetAllOutages(limit int) ([]OutageInfo, error) {
-	devices, err := GetAllDevices()
+	type outageRow struct {
+		ID             uint
+		DeviceID       uint
+		DeviceName     string
+		Location       string
+		StartTime      time.Time
+		EndTime        *time.Time
+		Duration       int64
+		Cause          string
+		Confidence     string
+		Suppressed     bool
+		AcknowledgedAt *time.Time
+		Notes          string
+	}
+	query := DB.Table("outages").
+		Select("outages.id, outages.device_id, devices.name AS device_name, devices.location, outages.start_time, outages.end_time, outages.duration, outages.cause, outages.confidence, outages.suppressed, outages.acknowledged_at, outages.notes").
+		Joins("JOIN devices ON devices.id = outages.device_id AND devices.deleted_at IS NULL").
+		Order("outages.start_time DESC")
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	var rows []outageRow
+	if err := query.Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	all := make([]OutageInfo, 0, len(rows)+1)
+	for _, r := range rows {
+		all = append(all, OutageInfo{ID: r.ID, DeviceID: r.DeviceID, DeviceName: r.DeviceName, Location: r.Location, StartTime: r.StartTime, EndTime: r.EndTime, Duration: time.Duration(r.Duration), Cause: r.Cause, Confidence: r.Confidence, Suppressed: r.Suppressed, AcknowledgedAt: r.AcknowledgedAt, Notes: r.Notes})
+	}
+	ongoing, err := ongoingOutageInfos(nil)
 	if err != nil {
 		return nil, err
 	}
-
-	var allOutages []OutageInfo
-	for _, device := range devices {
-		outages, err := GetOutages(device.ID, 0)
-		if err != nil {
-			continue
-		}
-		allOutages = append(allOutages, outages...)
+	all = append(all, ongoing...)
+	sort.Slice(all, func(i, j int) bool { return all[i].StartTime.After(all[j].StartTime) })
+	if limit > 0 && len(all) > limit {
+		all = all[:limit]
 	}
+	return all, nil
+}
 
-	// Sort by start time (most recent first) and limit
-	// Simple bubble sort for small dataset
-	for i := 0; i < len(allOutages); i++ {
-		for j := i + 1; j < len(allOutages); j++ {
-			if allOutages[j].StartTime.After(allOutages[i].StartTime) {
-				allOutages[i], allOutages[j] = allOutages[j], allOutages[i]
-			}
-		}
+// CountOutages returns the total number of persisted outage records.
+func CountOutages() (int64, error) {
+	var count int64
+	err := DB.Model(&Outage{}).Count(&count).Error
+	return count, err
+}
+
+// CountOngoingOutages returns the number of devices currently offline (i.e.
+// with a derived, not-yet-persisted ongoing outage).
+func CountOngoingOutages() (int64, error) {
+	cutoff := time.Now().Add(-OfflineThreshold)
+	var count int64
+	err := DB.Model(&Device{}).Where("last_seen IS NOT NULL AND last_seen < ?", cutoff).Count(&count).Error
+	return count, err
+}
+
+// AcknowledgeOutage marks an outage as acknowledged, optionally attaching a note.
+func AcknowledgeOutage(id uint, notes string) (*Outage, error) {
+	updates := map[string]interface{}{"acknowledged_at": time.Now()}
+	if notes != "" {
+		updates["notes"] = notes
 	}
-
-	if limit > 0 && len(allOutages) > limit {
-		allOutages = allOutages[:limit]
+	result := DB.Model(&Outage{}).Where("id = ?", id).Updates(updates)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to acknowledge outage: %w", result.Error)
 	}
+	if result.RowsAffected == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var outage Outage
+	if err := DB.First(&outage, id).Error; err != nil {
+		return nil, err
+	}
+	return &outage, nil
+}
 
-	return allOutages, nil
+func IsMaintenanceActive(db *gorm.DB, deviceID uint, start, end time.Time) (bool, error) {
+	var count int64
+	err := db.Model(&MaintenanceWindow{}).Where("(device_id IS NULL OR device_id = ?) AND start_time < ? AND end_time > ?", deviceID, end, start).Count(&count).Error
+	return count > 0, err
+}
+
+// GetMaintenanceWindows returns maintenance windows that apply to a device:
+// windows scoped to it plus fleet-wide windows (device_id IS NULL).
+func GetMaintenanceWindows(deviceID uint) ([]MaintenanceWindow, error) {
+	var windows []MaintenanceWindow
+	err := DB.Where("device_id IS NULL OR device_id = ?", deviceID).Order("start_time DESC").Find(&windows).Error
+	return windows, err
 }
 
 // ResetAnalyticsData clears derived analytics while keeping device identity/token data.
@@ -297,6 +559,12 @@ func ResetAnalyticsData() error {
 
 		if err := tx.Exec("DELETE FROM daily_outage_summaries").Error; err != nil {
 			return fmt.Errorf("failed to clear daily outage summaries: %w", err)
+		}
+		if err := tx.Exec("DELETE FROM outages").Error; err != nil {
+			return fmt.Errorf("failed to clear outages: %w", err)
+		}
+		if err := tx.Exec("DELETE FROM daily_event_rollups").Error; err != nil {
+			return fmt.Errorf("failed to clear event rollups: %w", err)
 		}
 
 		if err := tx.Model(&Device{}).Where("1 = 1").Update("last_seen", nil).Error; err != nil {
@@ -318,52 +586,12 @@ func DeleteOldEvents(retentionDays int) (int64, error) {
 	return result.RowsAffected, nil
 }
 
-// UpdateOutageSummaryOnBoot is called whenever a boot (power-restored) event is recorded.
-// It looks for the most recent event before bootTime; if the gap exceeds 2 minutes, it
-// records the outage in DailyOutageSummary keyed to the day the outage started.
-func UpdateOutageSummaryOnBoot(deviceID uint, bootTime time.Time) error {
-	var lastEvent Event
-	if err := DB.Where("device_id = ? AND timestamp < ?", deviceID, bootTime).
-		Order("timestamp DESC").First(&lastEvent).Error; err != nil {
-		// No previous event — nothing to record.
-		return nil
-	}
-
-	gap := bootTime.Sub(lastEvent.Timestamp)
-	if gap <= 2*time.Minute {
-		return nil
-	}
-
-	// Attribute the outage to the calendar day it started.
-	loc := lastEvent.Timestamp.Location()
-	startDay := time.Date(lastEvent.Timestamp.Year(), lastEvent.Timestamp.Month(), lastEvent.Timestamp.Day(), 0, 0, 0, 0, loc)
-
-	var summary DailyOutageSummary
-	err := DB.Where("device_id = ? AND date = ?", deviceID, startDay).First(&summary).Error
-	if err != nil {
-		// Create a fresh row.
-		summary = DailyOutageSummary{
-			DeviceID:      deviceID,
-			Date:          startDay,
-			OutageCount:   1,
-			TotalDowntime: int64(gap),
-		}
-		return DB.Create(&summary).Error
-	}
-
-	// Increment existing row.
-	return DB.Model(&summary).Updates(map[string]interface{}{
-		"outage_count":   summary.OutageCount + 1,
-		"total_downtime": summary.TotalDowntime + int64(gap),
-	}).Error
-}
-
 // GetDeviceOutageStats returns aggregated outage counts for today, current month, and current year.
 func GetDeviceOutageStats(deviceID uint) (*OutageStats, error) {
-	now := time.Now()
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, now.Location())
+	now := time.Now().In(DisplayLocation)
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, DisplayLocation)
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, DisplayLocation)
+	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, DisplayLocation)
 
 	type aggRow struct {
 		OutageCount   int
@@ -402,6 +630,71 @@ func GetDeviceOutageStats(deviceID uint) (*OutageStats, error) {
 	}, nil
 }
 
+// AvailabilityReport is export-friendly availability data for a requested window.
+type AvailabilityReport struct {
+	Device        Device        `json:"device"`
+	From          time.Time     `json:"from"`
+	To            time.Time     `json:"to"`
+	OutageCount   int64         `json:"outage_count"`
+	Downtime      time.Duration `json:"downtime"`
+	UptimePercent float64       `json:"uptime_percent"`
+}
+
+func GetAvailabilityReport(deviceID uint, from, to time.Time) (*AvailabilityReport, error) {
+	device, err := GetDeviceByID(deviceID)
+	if err != nil {
+		return nil, err
+	}
+	var outages []Outage
+	if err := DB.Where("device_id = ? AND start_time < ? AND (end_time IS NULL OR end_time > ?) AND suppressed = ?", deviceID, to, from, false).Find(&outages).Error; err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	if device.LastSeen != nil && now.Sub(*device.LastSeen) > OfflineThreshold {
+		// The device is offline right now and hasn't recovered yet, so
+		// RecordEvent hasn't (and can't yet) written an Outage row for this
+		// gap. Derive it so an ongoing outage isn't reported as 100% uptime.
+		suppressed, err := IsMaintenanceActive(DB, deviceID, *device.LastSeen, now)
+		if err != nil {
+			return nil, err
+		}
+		if !suppressed && device.LastSeen.Before(to) && now.After(from) {
+			outages = append(outages, Outage{DeviceID: deviceID, StartTime: *device.LastSeen, EndTime: &now})
+		}
+	}
+
+	var count int64
+	var downtime time.Duration
+	for _, o := range outages {
+		end := to
+		if o.EndTime != nil && o.EndTime.Before(to) {
+			end = *o.EndTime
+		}
+		start := from
+		if o.StartTime.After(from) {
+			start = o.StartTime
+		}
+		if overlap := end.Sub(start); overlap > 0 {
+			downtime += overlap
+			count++
+		}
+	}
+
+	total := to.Sub(from)
+	uptime := 100.0
+	if total > 0 {
+		uptime = 100 * float64(maxDuration(0, total-downtime)) / float64(total)
+	}
+	return &AvailabilityReport{Device: *device, From: from, To: to, OutageCount: count, Downtime: downtime, UptimePercent: uptime}, nil
+}
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // ChartBucket holds aggregated event counts for one time bucket
 type ChartBucket struct {
 	Label      string `json:"label"`     // Human-readable bucket label
@@ -418,10 +711,23 @@ func GetEventChartData(deviceID uint, rangeHours int, buckets int) ([]ChartBucke
 	from := now.Add(-time.Duration(rangeHours) * time.Hour)
 	bucketDur := time.Duration(rangeHours) * time.Hour / time.Duration(buckets)
 
+	rawFrom := from
+	if rangeHours > 7*24 {
+		// Align to a day boundary so this cutoff matches the day-truncated
+		// rollup dates below; otherwise the boundary day's events get
+		// counted twice (once via its rollup, once via raw rows).
+		rawFrom = dayBucket(now.AddDate(0, 0, -7))
+	}
 	var events []Event
-	if err := DB.Where("device_id = ? AND timestamp >= ?", deviceID, from).
-		Order("timestamp ASC").Find(&events).Error; err != nil {
+	if err := DB.Where("device_id = ? AND timestamp >= ?", deviceID, rawFrom).Order("timestamp ASC").Find(&events).Error; err != nil {
 		return nil, fmt.Errorf("failed to fetch events for chart: %w", err)
+	}
+	var rollups []DailyEventRollup
+	if rangeHours > 7*24 {
+		// Raw rows may already be pruned; daily rollups preserve historical chart data.
+		if err := DB.Where("device_id = ? AND date >= ? AND date < ?", deviceID, from, rawFrom).Find(&rollups).Error; err != nil {
+			return nil, fmt.Errorf("failed to fetch event rollups: %w", err)
+		}
 	}
 
 	result := make([]ChartBucket, buckets)
@@ -442,6 +748,13 @@ func GetEventChartData(deviceID uint, rangeHours int, buckets int) ([]ChartBucke
 				} else {
 					b.Heartbeats++
 				}
+			}
+		}
+		for _, r := range rollups {
+			if !r.Date.Before(bucketStart) && r.Date.Before(bucketEnd) {
+				b.Heartbeats += r.Heartbeats
+				b.Boots += r.Boots
+				b.Total += r.Heartbeats + r.Boots
 			}
 		}
 		result[i] = b

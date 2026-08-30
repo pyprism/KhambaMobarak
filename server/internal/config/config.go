@@ -6,19 +6,54 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const (
 	AppName        = "khamba"
 	DefaultPort    = 8080
 	ConfigFileName = "config.json"
+
+	// DefaultHeartbeatInterval mirrors the firmware's HEARTBEAT_INTERVAL. It's
+	// only used to derive DefaultOfflineThresholdSeconds below.
+	DefaultHeartbeatInterval = 60
+	// DefaultOfflineThresholdSeconds is >=3x the firmware heartbeat interval,
+	// so a couple of missed/delayed heartbeats don't flap a device offline.
+	DefaultOfflineThresholdSeconds = 3 * DefaultHeartbeatInterval
+	// DefaultRetentionDays is how long raw events are kept before pruning.
+	DefaultRetentionDays = 7
 )
 
 // Config represents the server configuration
 type Config struct {
 	Port      int    `json:"port"`
+	Host      string `json:"host"` // Bind address; empty means all interfaces
 	DBPath    string `json:"db_path"`
 	ConfigDir string `json:"-"` // Not stored in JSON
+
+	// OfflineThresholdSeconds is how long a device can go without a heartbeat
+	// before it's considered offline / an outage is recorded.
+	OfflineThresholdSeconds int `json:"offline_threshold_seconds"`
+	// RetentionDays is how long raw events are kept before pruning. 0 disables
+	// the retention worker entirely.
+	RetentionDays int `json:"retention_days"`
+	// DisplayTimezone is an IANA timezone name (e.g. "America/New_York") used
+	// to bucket daily outage summaries and "today/this month/this year"
+	// boundaries. Empty means UTC.
+	DisplayTimezone string `json:"display_timezone"`
+}
+
+// Location resolves DisplayTimezone to a *time.Location, defaulting to UTC
+// when unset or invalid.
+func (c *Config) Location() *time.Location {
+	if c.DisplayTimezone == "" {
+		return time.UTC
+	}
+	loc, err := time.LoadLocation(c.DisplayTimezone)
+	if err != nil {
+		return time.UTC
+	}
+	return loc
 }
 
 // GetConfigDir returns the XDG config directory for the application
@@ -63,8 +98,10 @@ func DefaultConfig() (*Config, error) {
 	}
 
 	return &Config{
-		Port:   DefaultPort,
-		DBPath: filepath.Join(dataDir, "khamba.db"),
+		Port:                    DefaultPort,
+		DBPath:                  filepath.Join(dataDir, "khamba.db"),
+		OfflineThresholdSeconds: DefaultOfflineThresholdSeconds,
+		RetentionDays:           DefaultRetentionDays,
 	}, nil
 }
 
@@ -85,7 +122,7 @@ func Load() (*Config, error) {
 			return nil, err
 		}
 		cfg.ConfigDir = configDir
-		return cfg, nil
+		return cfg, cfg.Validate()
 	}
 
 	// Read and parse config file
@@ -94,17 +131,60 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	// Fields added after the initial release use pointers here so a config
+	// file written before they existed gets their defaults instead of a zero
+	// value that Validate would otherwise reject (or that would silently
+	// disable retention).
+	var raw struct {
+		Port                    int    `json:"port"`
+		Host                    string `json:"host"`
+		DBPath                  string `json:"db_path"`
+		OfflineThresholdSeconds *int   `json:"offline_threshold_seconds"`
+		RetentionDays           *int   `json:"retention_days"`
+		DisplayTimezone         string `json:"display_timezone"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	cfg := Config{Port: raw.Port, Host: raw.Host, DBPath: raw.DBPath, DisplayTimezone: raw.DisplayTimezone}
+	if raw.OfflineThresholdSeconds != nil {
+		cfg.OfflineThresholdSeconds = *raw.OfflineThresholdSeconds
+	} else {
+		cfg.OfflineThresholdSeconds = DefaultOfflineThresholdSeconds
+	}
+	if raw.RetentionDays != nil {
+		cfg.RetentionDays = *raw.RetentionDays
+	} else {
+		cfg.RetentionDays = DefaultRetentionDays
+	}
+
 	cfg.ConfigDir = configDir
-	return &cfg, nil
+	return &cfg, cfg.Validate()
+}
+
+// Validate rejects values that would otherwise fail later with vague errors.
+func (c *Config) Validate() error {
+	if c.Port < 1 || c.Port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535")
+	}
+	if filepath.Clean(c.DBPath) == "." || c.DBPath == "" {
+		return fmt.Errorf("db_path cannot be empty")
+	}
+	if c.OfflineThresholdSeconds < 1 {
+		return fmt.Errorf("offline_threshold_seconds must be positive")
+	}
+	if c.RetentionDays < 0 {
+		return fmt.Errorf("retention_days cannot be negative (use 0 to disable pruning)")
+	}
+	return nil
 }
 
 // Save saves the configuration to the config file
 func (c *Config) Save() error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
 	configDir, err := GetConfigDir()
 	if err != nil {
 		return err

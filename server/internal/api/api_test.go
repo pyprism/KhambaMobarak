@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"khamba/internal/models"
 
@@ -150,6 +151,48 @@ func TestHandleEventRecordsEvent(t *testing.T) {
 	}
 	if events[0].EventType != models.EventTypeHeartbeat {
 		t.Fatalf("expected heartbeat event, got %q", events[0].EventType)
+	}
+}
+
+func TestHandleEventDeduplicatesEventID(t *testing.T) {
+	r := setupTestRouter(t)
+	device, token, err := models.CreateDevice("Retry", "HQ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		req := httptest.NewRequest(http.MethodPost, "/api/events", bytes.NewBufferString(`{"event_type":"heartbeat","event_id":"retry-1"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp := httptest.NewRecorder()
+		r.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.Code)
+		}
+	}
+	_, total, err := models.GetDeviceEvents(device.ID, 10, 0)
+	if err != nil || total != 1 {
+		t.Fatalf("expected one event after retry, total=%d err=%v", total, err)
+	}
+}
+
+func TestPaginationAndReportValidation(t *testing.T) {
+	r := setupTestRouter(t)
+	device, _, err := models.CreateDevice("Report", "HQ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := httptest.NewRequest(http.MethodGet, "/api/devices/"+strconv.Itoa(int(device.ID))+"/events?limit=-1", nil)
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, bad)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad pagination to return 400, got %d", resp.Code)
+	}
+	report := httptest.NewRequest(http.MethodGet, "/api/devices/"+strconv.Itoa(int(device.ID))+"/report?days=30", nil)
+	resp = httptest.NewRecorder()
+	r.ServeHTTP(resp, report)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), "uptime_percent") {
+		t.Fatalf("expected availability report, got %d %s", resp.Code, resp.Body.String())
 	}
 }
 
@@ -323,6 +366,103 @@ func TestGetDeviceChartDataEndpoint(t *testing.T) {
 			t.Fatalf("expected buckets in chart response")
 		}
 	})
+}
+
+func TestSweepExpiredIngestEntriesEvictsOnlyExpired(t *testing.T) {
+	ingestRates.Lock()
+	ingestRates.entries = map[string]rateEntry{
+		"expired": {count: 5, reset: time.Now().Add(-time.Minute)},
+		"active":  {count: 5, reset: time.Now().Add(time.Minute)},
+	}
+	ingestRates.Unlock()
+
+	sweepExpiredIngestEntries(time.Now())
+
+	ingestRates.Lock()
+	_, expiredStillThere := ingestRates.entries["expired"]
+	_, activeStillThere := ingestRates.entries["active"]
+	ingestRates.Unlock()
+
+	if expiredStillThere {
+		t.Fatalf("expected expired entry to be evicted")
+	}
+	if !activeStillThere {
+		t.Fatalf("expected active entry to survive the sweep")
+	}
+}
+
+func TestCreateAndUpdateDeviceEndpoints(t *testing.T) {
+	r := setupTestRouter(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/devices", bytes.NewBufferString(`{"name":"New Node","location":"Attic"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusCreated, resp.Code, resp.Body.String())
+	}
+	body := decodeMapBody(t, resp)
+	if body["token"] == nil || body["token"].(string) == "" {
+		t.Fatalf("expected a device token in response, got %#v", body)
+	}
+	device := body["device"].(map[string]any)
+	id := int(device["id"].(float64))
+
+	badReq := httptest.NewRequest(http.MethodPost, "/api/devices", bytes.NewBufferString(`{"name":""}`))
+	badReq.Header.Set("Content-Type", "application/json")
+	badResp := httptest.NewRecorder()
+	r.ServeHTTP(badResp, badReq)
+	if badResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected empty name to be rejected, got %d", badResp.Code)
+	}
+
+	patchReq := httptest.NewRequest(http.MethodPatch, "/api/devices/"+strconv.Itoa(id), bytes.NewBufferString(`{"location":"Basement"}`))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchResp := httptest.NewRecorder()
+	r.ServeHTTP(patchResp, patchReq)
+	if patchResp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, patchResp.Code, patchResp.Body.String())
+	}
+	patched := decodeMapBody(t, patchResp)
+	if patched["name"] != "New Node" || patched["location"] != "Basement" {
+		t.Fatalf("expected name unchanged and location updated, got %#v", patched)
+	}
+}
+
+func TestAcknowledgeOutageEndpoint(t *testing.T) {
+	r := setupTestRouter(t)
+
+	device, _, err := models.CreateDevice("Ack Endpoint Node", "Lab")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+	end := time.Now()
+	outage := models.Outage{DeviceID: device.ID, StartTime: end.Add(-time.Hour), EndTime: &end, Duration: int64(time.Hour), Cause: "connectivity", Confidence: "inferred"}
+	if err := models.DB.Create(&outage).Error; err != nil {
+		t.Fatalf("failed to create outage: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/outages/"+strconv.Itoa(int(outage.ID)), bytes.NewBufferString(`{"notes":"replaced fuse"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	body := decodeMapBody(t, resp)
+	if body["notes"] != "replaced fuse" {
+		t.Fatalf("expected notes to be persisted, got %#v", body)
+	}
+	if body["acknowledged_at"] == nil {
+		t.Fatalf("expected acknowledged_at to be set")
+	}
+
+	missing := httptest.NewRequest(http.MethodPatch, "/api/outages/999999", nil)
+	missingResp := httptest.NewRecorder()
+	r.ServeHTTP(missingResp, missing)
+	if missingResp.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d for missing outage, got %d", http.StatusNotFound, missingResp.Code)
+	}
 }
 
 func TestGetAllOutagesEndpoint(t *testing.T) {
