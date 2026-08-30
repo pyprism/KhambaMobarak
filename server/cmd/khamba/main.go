@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -311,7 +313,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	}
 
 	// Start server
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	fmt.Printf("Khamba Mobarak Power Monitor\n")
 	fmt.Printf("Dashboard: http://localhost:%d\n", cfg.Port)
 	fmt.Printf("Database: %s\n", cfg.DBPath)
