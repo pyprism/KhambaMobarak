@@ -2,7 +2,7 @@
 .idea
 
 # Binaries
-server/khamba
+server/khamba*
 *.exe
 *.dll
 *.so
