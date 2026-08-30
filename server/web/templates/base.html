@@ -1,6 +1,22 @@
+{{ define "themeInit" }}
+    <script>
+        (function () {
+            try {
+                var pref = localStorage.getItem('theme') || 'auto';
+                var resolved = pref === 'auto' ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : pref;
+                document.documentElement.dataset.bsTheme = resolved;
+            } catch (e) {}
+        })();
+    </script>
+{{ end }}
+
 {{ define "styles" }}
     <style>
-        :root {
+		@font-face { font-family: bootstrap-icons; src: url('/static/bootstrap-icons.woff2') format('woff2'); }
+        /* Scoped to light so it doesn't out-cascade Bootstrap's own dark
+           --bs-body-bg (same specificity, this file loads later) and leave
+           a light-gray page behind dark cards/navbar. */
+        :root:not([data-bs-theme="dark"]) {
             --bs-body-bg: #f8f9fa;
         }
         html, body {
@@ -72,7 +88,8 @@
         }
         .outage-item.ongoing {
             border-left-color: #ffc107;
-            background-color: #fff3cd;
+            background-color: var(--bs-warning-bg-subtle);
+            color: var(--bs-warning-text-emphasis);
             padding: 10px 15px;
             border-radius: 0 5px 5px 0;
         }
@@ -81,13 +98,13 @@
             overflow-y: auto;
         }
         .time-ago {
-            color: #6c757d;
+            color: var(--bs-secondary-color);
             font-size: 0.875rem;
         }
         .empty-state {
             text-align: center;
             padding: 3rem;
-            color: #6c757d;
+            color: var(--bs-secondary-color);
         }
         .empty-state i {
             font-size: 4rem;
@@ -111,6 +128,7 @@
                     <li class="nav-item">
                         <a class="nav-link active" href="/"><i class="bi bi-speedometer2"></i> Dashboard</a>
                     </li>
+					<li class="nav-item"><button id="themeToggle" class="btn btn-sm btn-outline-light ms-lg-2" type="button" aria-label="Theme: auto (click to change)">◐</button></li>
                 </ul>
             </div>
         </div>
@@ -126,12 +144,52 @@
 {{ end }}
 
 {{ define "scripts" }}
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="/static/bootstrap.bundle.min.js"></script>
     <script>
-        // Auto-refresh every 30 seconds
-        setTimeout(function() {
+        // Theme: light / dark / auto (system preference), cycled by the navbar
+        // button. The actual dataset.bsTheme was already set synchronously in
+        // <head> (see "themeInit") to avoid a flash of the wrong theme; this
+        // wires up the toggle and keeps "auto" live against OS changes.
+        const THEME_ICON = { light: '☀', dark: '☾', auto: '◐' };
+        function resolveTheme(pref) {
+            return pref === 'auto' ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : pref;
+        }
+        function applyTheme(pref) {
+            const resolved = resolveTheme(pref);
+            document.documentElement.dataset.bsTheme = resolved;
+            const btn = document.getElementById('themeToggle');
+            if (btn) {
+                btn.textContent = THEME_ICON[pref] || THEME_ICON.auto;
+                btn.setAttribute('aria-label', 'Theme: ' + pref + ' (click to change)');
+            }
+            document.dispatchEvent(new CustomEvent('themechange', { detail: { theme: resolved } }));
+        }
+        let themePref = localStorage.getItem('theme') || 'auto';
+        applyTheme(themePref);
+        matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+            if (themePref === 'auto') applyTheme('auto');
+        });
+        document.getElementById('themeToggle')?.addEventListener('click', () => {
+            const order = ['light', 'dark', 'auto'];
+            themePref = order[(order.indexOf(themePref) + 1) % order.length];
+            localStorage.setItem('theme', themePref);
+            applyTheme(themePref);
+        });
+        // Auto-refresh every 30 seconds, but not while the user has an open
+        // form (add/edit device, maintenance) or a just-created device token
+        // on screen — reloading then would silently discard unsaved input or
+        // the one-time token before they've copied it.
+        function reloadUnlessBusy() {
+            const busy = document.querySelector('.collapse.show') ||
+                (document.getElementById('newDeviceToken')?.style.display === 'block') ||
+                ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
+            if (busy) {
+                setTimeout(reloadUnlessBusy, 5000);
+                return;
+            }
             location.reload();
-        }, 30000);
+        }
+        setTimeout(reloadUnlessBusy, 30000);
 
         // Format relative time (expects ISO 8601 string)
         function timeAgo(dateString) {
