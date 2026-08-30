@@ -22,7 +22,7 @@ func newConfigOverrideCommand(t *testing.T) *cobra.Command {
 
 func TestApplyConfigOverridesLeavesDefaultsWhenFlagsUnset(t *testing.T) {
 	cmd := newConfigOverrideCommand(t)
-	cfg := &config.Config{Port: 8080, DBPath: "/tmp/default.db"}
+	cfg := &config.Config{Port: 8080, DBPath: "/tmp/default.db", OfflineThresholdSeconds: config.DefaultOfflineThresholdSeconds, RetentionDays: config.DefaultRetentionDays}
 
 	if err := applyConfigOverrides(cmd, cfg); err != nil {
 		t.Fatalf("applyConfigOverrides returned error: %v", err)
@@ -45,7 +45,7 @@ func TestApplyConfigOverridesAppliesExplicitFlags(t *testing.T) {
 		t.Fatalf("failed to set db flag: %v", err)
 	}
 
-	cfg := &config.Config{Port: 8080, DBPath: "/tmp/default.db"}
+	cfg := &config.Config{Port: 8080, DBPath: "/tmp/default.db", OfflineThresholdSeconds: config.DefaultOfflineThresholdSeconds, RetentionDays: config.DefaultRetentionDays}
 	if err := applyConfigOverrides(cmd, cfg); err != nil {
 		t.Fatalf("applyConfigOverrides returned error: %v", err)
 	}
