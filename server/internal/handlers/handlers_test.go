@@ -100,6 +100,41 @@ func TestDashboardHandlerRenders12HourVisibleTimesAndISOTimestamps(t *testing.T)
 	}
 }
 
+func TestHealthzEndpointReturnsOK(t *testing.T) {
+	r := setupHandlersRouter(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, resp.Code)
+	}
+	if !strings.Contains(resp.Body.String(), `"status":"ok"`) {
+		t.Fatalf("expected ok status in body, got %s", resp.Body.String())
+	}
+}
+
+func TestMetricsEndpointExposesCounters(t *testing.T) {
+	r := setupHandlersRouter(t)
+
+	if _, _, err := models.CreateDevice("Metrics Node", "Lab"); err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, resp.Code)
+	}
+	body := resp.Body.String()
+	if !strings.Contains(body, "khamba_devices_total 1") {
+		t.Fatalf("expected khamba_devices_total gauge in output, got %s", body)
+	}
+}
+
 func TestDeviceDetailHandlerValidationAndNotFound(t *testing.T) {
 	r := setupHandlersRouter(t)
 
