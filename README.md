@@ -68,7 +68,9 @@ pio run -e esp32dev -t upload
 - Power on the ESP device
 - Connect your phone/laptop to WiFi SSID: `KhambaMobarak-Setup` (open network, no password)
 - Open the captive portal (http://192.168.4.1)
-- Enter your home WiFi SSID and password, server URL (e.g. `http://192.168.1.100:8080`) and the device token created earlier
+- Enter your home WiFi SSID and password, server URL, and the device token created earlier
+  - Plain `http://192.168.1.100:8080` works as-is for a server on your LAN
+  - For a server reachable outside your LAN, use `https://...` and paste its CA certificate (PEM) into the setup form
 - Save and the ESP will restart and connect to your network
 
 4. Reconfiguration:
@@ -101,8 +103,12 @@ Coverage ignore rules are defined in `server/.coveragerc` (used by `make coverag
 # Clear analytics data (keeps devices/tokens)
 ./khamba clean
 
-# Custom listen port / DB path
-./khamba serve --port 9000 --db /path/to/khamba.db
+# Custom listen port / bind address / DB path
+./khamba serve --port 9000 --host 0.0.0.0 --db /path/to/khamba.db
+
+# Back up / restore the SQLite database (server must be stopped to restore)
+./khamba backup /path/to/backup.db
+./khamba restore /path/to/backup.db
 
 # Device management
 ./khamba device create --name "Kitchen" --location "Home"
@@ -126,13 +132,17 @@ Coverage ignore rules are defined in `server/.coveragerc` (used by `make coverag
 
 `install` now accepts the same `--port` and `--db` overrides as `serve`, but it persists them into `~/.config/khamba/config.json` so the generated service can keep using plain `khamba serve`.
 
+`backup` writes a consistent SQLite snapshot (safe to run while the server is up); `restore` replaces the configured database with a backup file and should only be run while the server is stopped.
+
+`serve` also accepts `--offline-threshold <seconds>`, `--retention-days <n>` (0 disables event pruning), and `--display-timezone <IANA name>` — see Configuration below.
+
 
 ## How it works
 
 1. Device loses power during outage and stops sending heartbeats
 2. When power returns the ESP boots and sends a `boot` event
 3. Device sends `heartbeat` events every 60s
-4. Server marks device offline if no heartbeat for configured threshold (default ~2 mins)
+4. Server marks device offline if no heartbeat for the configured threshold (default 3 minutes)
 5. Dashboard shows outages, durations and device status
 
 ## Configuration
@@ -142,9 +152,15 @@ Server config: `~/.config/khamba/config.json`
 ```json
 {
   "port": 8080,
-  "db_path": "/home/user/.local/share/khamba/khamba.db"
+  "host": "",
+  "db_path": "/home/user/.local/share/khamba/khamba.db",
+  "offline_threshold_seconds": 180,
+  "retention_days": 7,
+  "display_timezone": ""
 }
 ```
+
+`host` empty binds all interfaces (needed for ESP devices on the LAN to reach it). `display_timezone` is an IANA name (e.g. `"America/New_York"`); empty means UTC.
 
 Client config: stored in LittleFS on the device at `/config.json` (contains `serverUrl` and `deviceToken`).
 
