@@ -2,8 +2,11 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"khamba/internal/models"
 
@@ -11,12 +14,72 @@ import (
 )
 
 const recentEventLimit = 20
+const availabilityWindowDays = 30
 
 // RegisterRoutes registers web page routes
 func RegisterRoutes(r *gin.Engine) {
 	// Dashboard
 	r.GET("/", dashboardHandler)
 	r.GET("/devices/:id", deviceDetailHandler)
+
+	// Infra endpoints
+	r.GET("/healthz", healthzHandler)
+	r.GET("/metrics", metricsHandler)
+}
+
+// healthzHandler is a liveness/readiness probe for systemd/uptime checks. It
+// touches the database so a broken connection is reported as unhealthy.
+func healthzHandler(c *gin.Context) {
+	if _, err := models.GetAllDevices(); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// metricsHandler exposes basic fleet counters in Prometheus text exposition
+// format, built from data already collected for the dashboard.
+func metricsHandler(c *gin.Context) {
+	devices, err := models.GetAllDevices()
+	if err != nil {
+		c.String(http.StatusInternalServerError, "# failed to load devices\n")
+		return
+	}
+	online := 0
+	for _, d := range devices {
+		if d.IsOnline {
+			online++
+		}
+	}
+	totalOutages, err := models.CountOutages()
+	if err != nil {
+		c.String(http.StatusInternalServerError, "# failed to load outages\n")
+		return
+	}
+	ongoingOutages, err := models.CountOngoingOutages()
+	if err != nil {
+		c.String(http.StatusInternalServerError, "# failed to load ongoing outages\n")
+		return
+	}
+
+	lines := []string{
+		"# HELP khamba_devices_total Total registered devices.",
+		"# TYPE khamba_devices_total gauge",
+		fmt.Sprintf("khamba_devices_total %d", len(devices)),
+		"# HELP khamba_devices_online Devices currently online.",
+		"# TYPE khamba_devices_online gauge",
+		fmt.Sprintf("khamba_devices_online %d", online),
+		"# HELP khamba_devices_offline Devices currently offline.",
+		"# TYPE khamba_devices_offline gauge",
+		fmt.Sprintf("khamba_devices_offline %d", len(devices)-online),
+		"# HELP khamba_outages_total Total persisted outage records.",
+		"# TYPE khamba_outages_total counter",
+		fmt.Sprintf("khamba_outages_total %d", totalOutages),
+		"# HELP khamba_outages_ongoing Devices currently in an outage.",
+		"# TYPE khamba_outages_ongoing gauge",
+		fmt.Sprintf("khamba_outages_ongoing %d", ongoingOutages),
+	}
+	c.String(http.StatusOK, strings.Join(lines, "\n")+"\n")
 }
 
 // dashboardHandler renders the main dashboard
@@ -73,13 +136,19 @@ func deviceDetailHandler(c *gin.Context) {
 	outages, _ := models.GetOutages(uint(id), 20)
 	bootEvents, _ := models.GetBootEvents(uint(id), 10)
 	outageStats, _ := models.GetDeviceOutageStats(uint(id))
+	now := time.Now()
+	availability, _ := models.GetAvailabilityReport(uint(id), now.AddDate(0, 0, -availabilityWindowDays), now)
+	maintenanceWindows, _ := models.GetMaintenanceWindows(uint(id))
 
 	c.HTML(http.StatusOK, "device.html", gin.H{
-		"title":       device.Name + " - Power Monitor",
-		"device":      device,
-		"events":      events,
-		"outages":     outages,
-		"bootEvents":  bootEvents,
-		"outageStats": outageStats,
+		"title":              device.Name + " - Power Monitor",
+		"device":             device,
+		"events":             events,
+		"outages":            outages,
+		"bootEvents":         bootEvents,
+		"outageStats":        outageStats,
+		"availability":       availability,
+		"availabilityDays":   availabilityWindowDays,
+		"maintenanceWindows": maintenanceWindows,
 	})
 }
