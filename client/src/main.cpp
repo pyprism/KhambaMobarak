@@ -45,7 +45,6 @@
 #define MAX_RETRY_DELAY 120000    // 2 minutes max backoff
 #define INITIAL_RETRY_DELAY 5000  // 5 seconds initial retry
 #define WIFI_RECOVERY_AFTER_MS 120000
-#define SETUP_PASSWORD_PREFIX "KM-"
 
 // LED indicator (platform-specific)
 #if defined(ESP32)
@@ -661,15 +660,7 @@ void setupWiFiManager() {
 		if (!config.configured || !saveConfig(ca)) Serial.println("[ERROR] Configuration was not saved; correct the URL (https://, or http:// on a private LAN address), the 64-hex token, and the CA certificate if using https.");
     });
 
-	String suffix;
-	#if defined(ESP32)
-		suffix = String((uint32_t)ESP.getEfuseMac(), HEX);
-	#else
-		suffix = String(ESP.getChipId(), HEX);
-	#endif
-	String password = String(SETUP_PASSWORD_PREFIX) + suffix.substring(max(0, (int)suffix.length() - 6));
-	Serial.printf("[INFO] Setup AP password: %s\n", password.c_str());
-    bool connected = wm.autoConnect("KhambaMobarak-Setup", password.c_str());
+    bool connected = wm.autoConnect("KhambaMobarak-Setup");
 
     if (!connected) {
         Serial.println("[ERROR] Failed to connect to WiFi");
