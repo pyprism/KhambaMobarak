@@ -3,18 +3,23 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"khamba/internal/api"
@@ -32,6 +37,8 @@ var (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	rootCmd := &cobra.Command{
 		Use:     "khamba",
 		Short:   "Khamba Mobarak - Power Outage Monitor",
@@ -46,9 +53,13 @@ func main() {
 		RunE:  runServe,
 	}
 	serveCmd.Flags().IntP("port", "p", 0, "Port to listen on (default: 8080)")
+	serveCmd.Flags().String("host", "", "Bind address (default: all interfaces)")
 	serveCmd.Flags().StringP("db", "d", "", "Database file path")
 	serveCmd.Flags().Bool("clean", false, "Clear analytics data (events, last_seen) before starting")
 	serveCmd.Flags().Bool("reset-analytics", false, "Alias of --clean")
+	serveCmd.Flags().Int("offline-threshold", 0, "Seconds without a heartbeat before a device is offline (default: 180)")
+	serveCmd.Flags().Int("retention-days", -1, "Days to keep raw events; 0 disables pruning (default: 7)")
+	serveCmd.Flags().String("display-timezone", "", "IANA timezone for daily outage bucketing (default: UTC)")
 
 	// Clean command (shortcut for `serve --clean`)
 	cleanCmd := &cobra.Command{
@@ -57,9 +68,13 @@ func main() {
 		RunE:  runClean,
 	}
 	cleanCmd.Flags().IntP("port", "p", 0, "Port to listen on (default: 8080)")
+	cleanCmd.Flags().String("host", "", "Bind address (default: all interfaces)")
 	cleanCmd.Flags().StringP("db", "d", "", "Database file path")
 	cleanCmd.Flags().Bool("clean", true, "Clear analytics data (always enabled for this command)")
 	cleanCmd.Flags().Bool("reset-analytics", false, "Alias of --clean")
+	cleanCmd.Flags().Int("offline-threshold", 0, "Seconds without a heartbeat before a device is offline (default: 180)")
+	cleanCmd.Flags().Int("retention-days", -1, "Days to keep raw events; 0 disables pruning (default: 7)")
+	cleanCmd.Flags().String("display-timezone", "", "IANA timezone for daily outage bucketing (default: UTC)")
 
 	// Device commands
 	deviceCmd := &cobra.Command{
@@ -124,10 +139,81 @@ func main() {
 	}
 
 	rootCmd.AddCommand(serveCmd, cleanCmd, deviceCmd, dummyClientCmd, installCmd, uninstallCmd)
+	backupCmd := &cobra.Command{Use: "backup [destination]", Short: "Create a consistent SQLite backup", Args: cobra.ExactArgs(1), RunE: runBackup}
+	backupCmd.Flags().StringP("db", "d", "", "Database file path")
+	restoreCmd := &cobra.Command{Use: "restore [backup]", Short: "Restore a SQLite backup while the server is stopped", Args: cobra.ExactArgs(1), RunE: runRestore}
+	restoreCmd.Flags().StringP("db", "d", "", "Database file path")
+	rootCmd.AddCommand(backupCmd, restoreCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+func databasePathFor(cmd *cobra.Command) (string, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return "", err
+	}
+	db, err := cmd.Flags().GetString("db")
+	if err != nil {
+		return "", err
+	}
+	if db != "" {
+		cfg.DBPath = db
+	}
+	if err := cfg.Validate(); err != nil {
+		return "", err
+	}
+	return cfg.DBPath, nil
+}
+func runBackup(cmd *cobra.Command, args []string) error {
+	dbPath, err := databasePathFor(cmd)
+	if err != nil {
+		return err
+	}
+	if err := models.InitDB(dbPath); err != nil {
+		return err
+	}
+	if err := models.BackupDatabase(args[0]); err != nil {
+		return err
+	}
+	fmt.Printf("Backup written to %s\n", args[0])
+	return nil
+}
+func runRestore(cmd *cobra.Command, args []string) error {
+	dbPath, err := databasePathFor(cmd)
+	if err != nil {
+		return err
+	}
+	source, err := os.Open(args[0])
+	if err != nil {
+		return fmt.Errorf("failed to open backup: %w", err)
+	}
+	defer source.Close()
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		return err
+	}
+	temp := dbPath + ".restore"
+	destination, err := os.OpenFile(temp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(destination, source); err != nil {
+		destination.Close()
+		return err
+	}
+	if err := destination.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temp, dbPath); err != nil {
+		return fmt.Errorf("failed to replace database: %w", err)
+	}
+	if err := models.InitDB(dbPath); err != nil {
+		return fmt.Errorf("restored database is invalid: %w", err)
+	}
+	fmt.Printf("Restored %s to %s\n", args[0], dbPath)
+	return nil
 }
 
 func runServe(cmd *cobra.Command, _ []string) error {
@@ -141,6 +227,12 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	if err := applyConfigOverrides(cmd, cfg); err != nil {
 		return err
 	}
+	if err := applyServeOverrides(cmd, cfg); err != nil {
+		return err
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid server configuration: %w", err)
+	}
 
 	// Ensure directories exist
 	if err := config.EnsureDirectories(); err != nil {
@@ -151,6 +243,8 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	if err := models.InitDB(cfg.DBPath); err != nil {
 		return fmt.Errorf("failed to initialize database: %w", err)
 	}
+	models.OfflineThreshold = time.Duration(cfg.OfflineThresholdSeconds) * time.Second
+	models.DisplayLocation = cfg.Location()
 
 	cleanAnalytics, _ := cmd.Flags().GetBool("clean")
 	resetAnalytics, _ := cmd.Flags().GetBool("reset-analytics")
@@ -164,8 +258,11 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	// Set Gin mode
 	gin.SetMode(gin.ReleaseMode)
 
-	// Create Gin router
-	r := gin.Default()
+	// Create Gin router with structured (JSON) request logging instead of
+	// gin.Default()'s plain-text logger, so systemd/journald consumers can
+	// filter and parse it.
+	r := gin.New()
+	r.Use(gin.Recovery(), slogRequestLogger())
 
 	// Load templates from embedded filesystem
 	tmpl, err := loadTemplates()
@@ -184,36 +281,89 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	// Register routes
 	api.RegisterRoutes(r)
 	handlers.RegisterRoutes(r)
+	r.NoRoute(func(c *gin.Context) {
+		c.HTML(http.StatusNotFound, "error.html", gin.H{"error": "Page not found"})
+	})
 
-	// Start event-retention background worker (delete events older than 7 days).
-	go func() {
-		const retentionDays = 7
-		runCleanup := func() {
-			n, err := models.DeleteOldEvents(retentionDays)
-			if err != nil {
-				fmt.Printf("[retention] failed to delete old events: %v\n", err)
-				return
+	// Start event-retention background worker (delete events older than
+	// cfg.RetentionDays days). RetentionDays == 0 disables it.
+	if cfg.RetentionDays > 0 {
+		go func() {
+			runCleanup := func() {
+				n, err := models.DeleteOldEvents(cfg.RetentionDays)
+				if err != nil {
+					slog.Error("retention cleanup failed", "error", err)
+					return
+				}
+				if n > 0 {
+					slog.Info("retention cleanup", "deleted", n, "retention_days", cfg.RetentionDays)
+				}
 			}
-			if n > 0 {
-				fmt.Printf("[retention] deleted %d event(s) older than %d days\n", n, retentionDays)
+			runCleanup() // run once at startup
+			ticker := time.NewTicker(24 * time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				runCleanup()
 			}
-		}
-		runCleanup() // run once at startup
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
-		for range ticker.C {
-			runCleanup()
-		}
-	}()
+		}()
+	} else {
+		slog.Info("event retention disabled (retention-days=0)")
+	}
 
 	// Start server
-	addr := fmt.Sprintf(":%d", cfg.Port)
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	fmt.Printf("Khamba Mobarak Power Monitor\n")
-	fmt.Printf("Dashboard: http://localhost%s\n", addr)
+	fmt.Printf("Dashboard: http://localhost:%d\n", cfg.Port)
 	fmt.Printf("Database: %s\n", cfg.DBPath)
 	fmt.Printf("Server starting on %s\n", addr)
 
-	return r.Run(addr)
+	server := &http.Server{
+		Addr: addr, Handler: r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// Graceful shutdown: stop accepting new connections and let in-flight
+	// requests finish when systemd (or an operator) sends SIGINT/SIGTERM,
+	// instead of Restart=always killing them mid-request.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.ListenAndServe() }()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		stop()
+		fmt.Println("Shutting down...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return server.Shutdown(shutdownCtx)
+	}
+}
+
+// slogRequestLogger replaces gin.Logger() with one JSON line per request via
+// log/slog, so deployments under systemd get structured, level-aware logs.
+func slogRequestLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		path := c.Request.URL.Path
+		c.Next()
+		slog.Info("request",
+			"method", c.Request.Method,
+			"path", path,
+			"status", c.Writer.Status(),
+			"latency_ms", time.Since(start).Milliseconds(),
+			"client_ip", c.ClientIP(),
+		)
+	}
 }
 
 func runClean(cmd *cobra.Command, args []string) error {
@@ -231,15 +381,10 @@ func loadTemplates() (*template.Template, error) {
 		return nil, err
 	}
 
-	// Template functions
-	funcs := template.FuncMap{
-		"formatDuration": func(d interface{}) string {
-			return fmt.Sprintf("%v", d)
-		},
-	}
-
-	// Create root template
-	root := template.New("").Funcs(funcs)
+	// Create root template. Duration formatting is done client-side (see
+	// base.html's formatDuration JS helper); templates don't need a Go
+	// FuncMap entry for it.
+	root := template.New("")
 
 	// Read all template files
 	entries, err := fs.ReadDir(templatesFS, ".")
@@ -287,7 +432,45 @@ func applyConfigOverrides(cmd *cobra.Command, cfg *config.Config) error {
 		cfg.DBPath = dbPath
 	}
 
-	return nil
+	return cfg.Validate()
+}
+
+// applyServeOverrides applies the serve/clean-only flags (host, offline
+// threshold, retention, display timezone) on top of applyConfigOverrides.
+func applyServeOverrides(cmd *cobra.Command, cfg *config.Config) error {
+	host, err := cmd.Flags().GetString("host")
+	if err != nil {
+		return fmt.Errorf("failed to read host flag: %w", err)
+	}
+	if host != "" {
+		cfg.Host = host
+	}
+
+	threshold, err := cmd.Flags().GetInt("offline-threshold")
+	if err != nil {
+		return fmt.Errorf("failed to read offline-threshold flag: %w", err)
+	}
+	if threshold > 0 {
+		cfg.OfflineThresholdSeconds = threshold
+	}
+
+	retention, err := cmd.Flags().GetInt("retention-days")
+	if err != nil {
+		return fmt.Errorf("failed to read retention-days flag: %w", err)
+	}
+	if retention >= 0 {
+		cfg.RetentionDays = retention
+	}
+
+	tz, err := cmd.Flags().GetString("display-timezone")
+	if err != nil {
+		return fmt.Errorf("failed to read display-timezone flag: %w", err)
+	}
+	if tz != "" {
+		cfg.DisplayTimezone = tz
+	}
+
+	return cfg.Validate()
 }
 
 func runDeviceCreate(cmd *cobra.Command, _ []string) error {
