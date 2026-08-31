@@ -44,7 +44,13 @@
 // still actively (if slowly) retrying.
 #define MAX_RETRY_DELAY 120000    // 2 minutes max backoff
 #define INITIAL_RETRY_DELAY 5000  // 5 seconds initial retry
-#define WIFI_RECOVERY_AFTER_MS 120000
+// The config portal is for *credential* failures (wrong password, moved
+// router), not transient drops — a router reboot or brief WiFi hiccup
+// commonly lasts 2-3 minutes and must not trigger it, since the portal
+// blocks sendEvent()/heartbeats for its own timeout and would turn that
+// hiccup into a guaranteed server-side outage. WiFi.reconnect() alone
+// (below, in loop()) keeps retrying quietly the whole time.
+#define WIFI_RECOVERY_AFTER_MS 600000
 
 // LED indicator (platform-specific)
 #if defined(ESP32)
@@ -107,8 +113,8 @@ void loadConfig();
 bool saveConfig(const char* serverCA);
 bool loadServerCA(String& out);
 bool requiresCA(const char* url);
-bool performRequest(HTTPClient& http, const String& payload);
-bool sendEvent(const char* eventType, String& eventID);
+bool performRequest(HTTPClient& http, const String& payload, int* httpCodeOut = nullptr);
+bool sendEvent(const char* eventType, String& eventID, bool* gotResponse = nullptr);
 void blinkLed(int times, int delayMs);
 void setupWiFiManager();
 bool initFilesystem();
@@ -236,6 +242,10 @@ void loop() {
 			Serial.println("[WARN] WiFi recovery timeout; opening secured setup portal");
 			setupWiFiManager();
 			wifiDisconnectedAt = 0;
+			// setupWiFiManager() already connected (or restarted trying to);
+			// dropping into WiFi.reconnect() below would tear down that fresh
+			// connection and reconnect it again for no reason.
+			return;
 		}
         WiFi.reconnect();
         delay(5000);
@@ -244,7 +254,6 @@ void loop() {
 	wifiDisconnectedAt = 0;
 
     // Send boot event (only once after power restoration)
-	replayQueuedEvents();
     unsigned long currentMillis = millis();
     // Signed-subtraction comparison: rollover-safe across the ~49.7-day
     // millis() wraparound (unlike a plain currentMillis >= nextRetryAt).
@@ -255,23 +264,36 @@ void loop() {
             return;
         }
         Serial.println("[INFO] Sending boot event...");
-        if (sendEvent("boot", bootEventID)) {
+        bool gotResponse = false;
+        if (sendEvent("boot", bootEventID, &gotResponse)) {
             bootEventSent = true;
             retryDelay = INITIAL_RETRY_DELAY;
             Serial.println("[OK] Boot event sent successfully");
             blinkLed(2, 100);
         } else {
             Serial.println("[ERROR] Failed to send boot event, will retry...");
+            // A TCP-level response (even a rejection) means the device is
+            // alive and reachable, not stuck in backoff limbo — reset before
+            // backing off again so a lone max-backoff hiccup can't push the
+            // gap past the server's offline threshold on its own.
+            if (gotResponse) retryDelay = INITIAL_RETRY_DELAY;
             nextRetryAt = currentMillis + retryDelay + random(0, 1000);
             retryDelay = min(retryDelay * 2, (unsigned long)MAX_RETRY_DELAY);
         }
         return;
     }
 
+    // Only replay queued events once the boot event for *this* power-up has
+    // gone out. Replaying first could deliver a stale queued heartbeat
+    // before the boot event, and the server would then close a real power
+    // outage on that heartbeat and misclassify it as a mere connectivity gap.
+    replayQueuedEvents();
+
     // Send heartbeat every HEARTBEAT_INTERVAL
     if (config.configured && retryDue && (unsigned long)(currentMillis - lastHeartbeat) >= HEARTBEAT_INTERVAL) {
         Serial.println("[INFO] Sending heartbeat...");
-        if (sendEvent("heartbeat", heartbeatEventID)) {
+        bool gotResponse = false;
+        if (sendEvent("heartbeat", heartbeatEventID, &gotResponse)) {
             lastHeartbeat = currentMillis;
             retryDelay = INITIAL_RETRY_DELAY;
 			nextRetryAt = currentMillis + HEARTBEAT_INTERVAL;
@@ -279,6 +301,8 @@ void loop() {
             blinkLed(1, 50);
         } else {
             Serial.println("[ERROR] Failed to send heartbeat");
+			// See the matching comment in the boot-event branch above.
+			if (gotResponse) retryDelay = INITIAL_RETRY_DELAY;
 			nextRetryAt = currentMillis + retryDelay + random(0, 1000);
 			retryDelay = min(retryDelay * 2, (unsigned long)MAX_RETRY_DELAY);
         }
@@ -391,10 +415,13 @@ bool saveConfig(const char* serverCA) {
 }
 
 // performRequest sends the already-built payload over an already-begin()'d
-// HTTPClient and reports whether the server accepted it. Split out so both
-// the HTTPS and plain-HTTP branches of sendEvent can share it while their
-// respective WiFiClient(Secure) stays in scope for the whole call.
-bool performRequest(HTTPClient& http, const String& payload) {
+// HTTPClient and reports whether the server accepted it. httpCodeOut, if
+// non-null, receives the raw HTTP response code (0 if the request never got
+// a TCP-level response at all), so a caller can tell "server rejected this"
+// apart from "never reached the server". Split out so both the HTTPS and
+// plain-HTTP branches of sendEvent can share it while their respective
+// WiFiClient(Secure) stays in scope for the whole call.
+bool performRequest(HTTPClient& http, const String& payload, int* httpCodeOut) {
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", String("Bearer ") + config.deviceToken);
     http.setTimeout(10000); // 10 second timeout
@@ -408,14 +435,20 @@ bool performRequest(HTTPClient& http, const String& payload) {
     Serial.print("[DEBUG] Response: ");
     Serial.println(response);
 
+    if (httpCodeOut) *httpCodeOut = httpCode;
     return httpCode == 200 || httpCode == 201;
 }
 
 // sendEvent posts one event. eventID is an in/out parameter: if empty, a
 // fresh ID is minted and left in place on failure (so the caller's next
 // retry reuses it instead of the server recording a duplicate); it's reset
-// to empty on success.
-bool sendEvent(const char* eventType, String& eventID) {
+// to empty on success. gotResponse, if non-null, is set to whether the
+// request reached the server and got an HTTP response at all (even a
+// non-2xx one) as opposed to failing before/during the TCP connection —
+// callers use that to distinguish "alive but rejected" from "unreachable"
+// for backoff purposes.
+bool sendEvent(const char* eventType, String& eventID, bool* gotResponse) {
+    if (gotResponse) *gotResponse = false;
     if (!config.configured) {
         Serial.println("[WARN] Device not configured");
         return false;
@@ -449,6 +482,7 @@ bool sendEvent(const char* eventType, String& eventID) {
 
     HTTPClient http;
     bool accepted = false;
+    int httpCode = 0;
 
     if (url.startsWith("https://")) {
         String ca;
@@ -468,7 +502,7 @@ bool sendEvent(const char* eventType, String& eventID) {
             Serial.println("[ERROR] Failed to initialize HTTPS client");
             return false;
         }
-        accepted = performRequest(http, payload);
+        accepted = performRequest(http, payload, &httpCode);
     } else {
         // Only reached for http:// URLs, which validConfig only accepts for
         // private/LAN hosts.
@@ -477,9 +511,10 @@ bool sendEvent(const char* eventType, String& eventID) {
             Serial.println("[ERROR] Failed to initialize HTTP client");
             return false;
         }
-        accepted = performRequest(http, payload);
+        accepted = performRequest(http, payload, &httpCode);
     }
 
+	if (gotResponse) *gotResponse = httpCode > 0;
 	if (!accepted && !replayingQueue) queueEvent(eventType, eventID);
 	if (accepted) eventID = "";
 	return accepted;
@@ -490,7 +525,11 @@ void queueEvent(const char* eventType, const String& eventID) {
 	JsonDocument doc;
 	File in = FILESYSTEM.open(EVENT_QUEUE_FILE, "r");
 	if (in) { deserializeJson(doc, in); in.close(); }
-	JsonArray events = doc["events"].to<JsonArray>();
+	// as<JsonArray>() on a key that's missing/wrong-typed returns a null
+	// JsonArray without touching doc; only fall back to to<JsonArray>() (which
+	// would wipe an existing array) when there's nothing there to preserve.
+	JsonArray events = doc["events"].as<JsonArray>();
+	if (events.isNull()) events = doc["events"].to<JsonArray>();
 	while (events.size() >= MAX_QUEUED_EVENTS) events.remove(0);
 	JsonObject event = events.add<JsonObject>();
 	event["type"] = eventType; event["id"] = eventID; event["timestamp"] = millis();
