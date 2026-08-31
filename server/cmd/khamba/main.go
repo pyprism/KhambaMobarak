@@ -248,6 +248,14 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	models.OfflineThreshold = time.Duration(cfg.OfflineThresholdSeconds) * time.Second
 	models.DisplayLocation = cfg.Location()
 
+	// Detect and suppress the false-outage wave a server restart (deploy,
+	// host reboot, crash) would otherwise stamp on every device: compare
+	// against the last-recorded heartbeat and, if we were down long enough
+	// to look like an outage, cover the gap with an auto maintenance window.
+	if err := models.RecordServerRestart(time.Now()); err != nil {
+		return fmt.Errorf("failed to record server restart: %w", err)
+	}
+
 	cleanAnalytics, _ := cmd.Flags().GetBool("clean")
 	resetAnalytics, _ := cmd.Flags().GetBool("reset-analytics")
 	if cleanAnalytics || resetAnalytics {
@@ -311,6 +319,19 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	} else {
 		slog.Info("event retention disabled (retention-days=0)")
 	}
+
+	// Periodically record that this process is still alive, so a future
+	// restart can tell a real fleet-wide power outage apart from the server
+	// itself having been down (see models.RecordServerRestart above).
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := models.UpdateServerHeartbeat(time.Now()); err != nil {
+				slog.Error("failed to update server heartbeat", "error", err)
+			}
+		}
+	}()
 
 	// Start server
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
