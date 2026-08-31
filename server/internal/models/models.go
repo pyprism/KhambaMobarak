@@ -94,16 +94,14 @@ type DailyOutageSummary struct {
 // power was presumably fine), or "planned" (deep-sleep wake). Confidence is
 // "inferred" or "confirmed" depending on whether a reset reason backed it up.
 type Outage struct {
-	ID             uint       `gorm:"primarykey" json:"id"`
-	DeviceID       uint       `gorm:"index;not null" json:"device_id"`
-	StartTime      time.Time  `gorm:"index;not null" json:"start_time"`
-	EndTime        *time.Time `json:"end_time,omitempty"`
-	Duration       int64      `gorm:"not null;default:0" json:"duration"`
-	Cause          string     `gorm:"size:32;not null;default:connectivity" json:"cause"`
-	Confidence     string     `gorm:"size:32;not null;default:inferred" json:"confidence"`
-	Suppressed     bool       `gorm:"not null;default:false" json:"suppressed"`
-	AcknowledgedAt *time.Time `json:"acknowledged_at,omitempty"`
-	Notes          string     `gorm:"size:1000" json:"notes,omitempty"`
+	ID         uint       `gorm:"primarykey" json:"id"`
+	DeviceID   uint       `gorm:"index;not null" json:"device_id"`
+	StartTime  time.Time  `gorm:"index;not null" json:"start_time"`
+	EndTime    *time.Time `json:"end_time,omitempty"`
+	Duration   int64      `gorm:"not null;default:0" json:"duration"`
+	Cause      string     `gorm:"size:32;not null;default:connectivity" json:"cause"`
+	Confidence string     `gorm:"size:32;not null;default:inferred" json:"confidence"`
+	Suppressed bool       `gorm:"not null;default:false" json:"suppressed"`
 }
 
 // DailyEventRollup preserves chart data after raw event retention expires.
@@ -113,6 +111,15 @@ type DailyEventRollup struct {
 	Date       time.Time `gorm:"uniqueIndex:idx_rollup_device_date;not null"`
 	Heartbeats int       `gorm:"not null;default:0"`
 	Boots      int       `gorm:"not null;default:0"`
+}
+
+// ServerHeartbeat holds the single-row timestamp of the last time this
+// process was known to be running. It's updated periodically while serving
+// and read once at startup to detect gaps caused by the server itself being
+// down (deploy, host reboot) rather than any device losing power.
+type ServerHeartbeat struct {
+	ID        uint      `gorm:"primarykey"`
+	LastAlive time.Time `gorm:"not null"`
 }
 
 // MaintenanceWindow suppresses incidents caused by planned work.
@@ -135,20 +142,17 @@ type OutageStats struct {
 }
 
 // OutageInfo represents information about a power outage.
-// ID is 0 for a derived/ongoing outage that has no persisted Outage row yet
-// (it cannot be acknowledged until the device recovers and the row is created).
+// ID is 0 for a derived/ongoing outage that has no persisted Outage row yet.
 type OutageInfo struct {
-	ID             uint          `json:"id,omitempty"`
-	DeviceID       uint          `json:"device_id"`
-	DeviceName     string        `json:"device_name"`
-	Location       string        `json:"location"`
-	StartTime      time.Time     `json:"start_time"`
-	EndTime        *time.Time    `json:"end_time,omitempty"`
-	Duration       time.Duration `json:"duration"`
-	IsOngoing      bool          `json:"is_ongoing"`
-	Cause          string        `json:"cause"`
-	Confidence     string        `json:"confidence"`
-	Suppressed     bool          `json:"suppressed"`
-	AcknowledgedAt *time.Time    `json:"acknowledged_at,omitempty"`
-	Notes          string        `json:"notes,omitempty"`
+	ID         uint          `json:"id,omitempty"`
+	DeviceID   uint          `json:"device_id"`
+	DeviceName string        `json:"device_name"`
+	Location   string        `json:"location"`
+	StartTime  time.Time     `json:"start_time"`
+	EndTime    *time.Time    `json:"end_time,omitempty"`
+	Duration   time.Duration `json:"duration"`
+	IsOngoing  bool          `json:"is_ongoing"`
+	Cause      string        `json:"cause"`
+	Confidence string        `json:"confidence"`
+	Suppressed bool          `json:"suppressed"`
 }
