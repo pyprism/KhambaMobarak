@@ -115,7 +115,6 @@ func RegisterRoutes(r *gin.Engine) {
 
 		// Dashboard data endpoints
 		api.GET("/outages", getAllOutages)
-		api.PATCH("/outages/:id", acknowledgeOutage)
 		api.GET("/stats", getDashboardStats)
 		api.GET("/maintenance", getMaintenance)
 		api.POST("/maintenance", createMaintenance)
@@ -421,33 +420,6 @@ func getAllOutages(c *gin.Context) {
 	c.JSON(http.StatusOK, outages)
 }
 
-type acknowledgeOutageRequest struct {
-	Notes string `json:"notes"`
-}
-
-// acknowledgeOutage marks a persisted outage as acknowledged, optionally
-// attaching a note. Derived/ongoing outages (no row yet) return 404.
-func acknowledgeOutage(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid outage ID"})
-		return
-	}
-	var req acknowledgeOutageRequest
-	if c.Request.ContentLength != 0 {
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-			return
-		}
-	}
-	outage, err := models.AcknowledgeOutage(uint(id), req.Notes)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "outage not found"})
-		return
-	}
-	c.JSON(http.StatusOK, outage)
-}
-
 type maintenanceRequest struct {
 	DeviceID  *uint     `json:"device_id"`
 	StartTime time.Time `json:"start_time"`
@@ -505,12 +477,23 @@ func getDashboardStats(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get stats"})
 		return
 	}
+	causeCounts, err := models.CountOutagesByCause()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get stats"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"total_devices": len(devices), "online_devices": onlineCount, "offline_devices": offlineCount,
-		// total_outages = persisted incidents plus devices currently mid-outage
+		// total_outages = persisted incidents (maintenance-suppressed and
+		// planned/deep-sleep wakes excluded) plus devices currently mid-outage
 		// (which have no row yet; see models.CountOngoingOutages).
 		"total_outages":   persistedOutages + ongoingOutages,
 		"ongoing_outages": ongoingOutages,
+		// Cause breakdown of persisted outages, so a router reboot doesn't
+		// read the same as a confirmed power cut.
+		"power_outages":        causeCounts.Power,
+		"connectivity_gaps":    causeCounts.Connectivity,
+		"device_reset_outages": causeCounts.DeviceReset,
 	})
 }
