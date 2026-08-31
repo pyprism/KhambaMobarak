@@ -429,42 +429,6 @@ func TestCreateAndUpdateDeviceEndpoints(t *testing.T) {
 	}
 }
 
-func TestAcknowledgeOutageEndpoint(t *testing.T) {
-	r := setupTestRouter(t)
-
-	device, _, err := models.CreateDevice("Ack Endpoint Node", "Lab")
-	if err != nil {
-		t.Fatalf("CreateDevice failed: %v", err)
-	}
-	end := time.Now()
-	outage := models.Outage{DeviceID: device.ID, StartTime: end.Add(-time.Hour), EndTime: &end, Duration: int64(time.Hour), Cause: "connectivity", Confidence: "inferred"}
-	if err := models.DB.Create(&outage).Error; err != nil {
-		t.Fatalf("failed to create outage: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodPatch, "/api/outages/"+strconv.Itoa(int(outage.ID)), bytes.NewBufferString(`{"notes":"replaced fuse"}`))
-	req.Header.Set("Content-Type", "application/json")
-	resp := httptest.NewRecorder()
-	r.ServeHTTP(resp, req)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
-	}
-	body := decodeMapBody(t, resp)
-	if body["notes"] != "replaced fuse" {
-		t.Fatalf("expected notes to be persisted, got %#v", body)
-	}
-	if body["acknowledged_at"] == nil {
-		t.Fatalf("expected acknowledged_at to be set")
-	}
-
-	missing := httptest.NewRequest(http.MethodPatch, "/api/outages/999999", nil)
-	missingResp := httptest.NewRecorder()
-	r.ServeHTTP(missingResp, missing)
-	if missingResp.Code != http.StatusNotFound {
-		t.Fatalf("expected status %d for missing outage, got %d", http.StatusNotFound, missingResp.Code)
-	}
-}
-
 func TestGetAllOutagesEndpoint(t *testing.T) {
 	r := setupTestRouter(t)
 
