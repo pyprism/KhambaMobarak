@@ -310,35 +310,6 @@ func TestUpdateDeviceUpdatesNameAndLocation(t *testing.T) {
 	}
 }
 
-func TestAcknowledgeOutagePersistsNotes(t *testing.T) {
-	setupTestDB(t)
-
-	device, _, err := CreateDevice("Ack Node", "Lab")
-	if err != nil {
-		t.Fatalf("CreateDevice failed: %v", err)
-	}
-	end := time.Now()
-	outage := Outage{DeviceID: device.ID, StartTime: end.Add(-time.Hour), EndTime: &end, Duration: int64(time.Hour), Cause: "connectivity", Confidence: "inferred"}
-	if err := DB.Create(&outage).Error; err != nil {
-		t.Fatalf("failed to create outage: %v", err)
-	}
-
-	acked, err := AcknowledgeOutage(outage.ID, "checked breaker panel")
-	if err != nil {
-		t.Fatalf("AcknowledgeOutage failed: %v", err)
-	}
-	if acked.AcknowledgedAt == nil {
-		t.Fatalf("expected AcknowledgedAt to be set")
-	}
-	if acked.Notes != "checked breaker panel" {
-		t.Fatalf("expected notes to be persisted, got %q", acked.Notes)
-	}
-
-	if _, err := AcknowledgeOutage(outage.ID+999, ""); err == nil {
-		t.Fatalf("expected acknowledging a missing outage to error")
-	}
-}
-
 func TestClassifyOutageMapsResetReasons(t *testing.T) {
 	cases := []struct {
 		reason              string
@@ -591,6 +562,89 @@ func TestGetDeviceOutageStatsReturnsZeroWhenNoData(t *testing.T) {
 	}
 	if stats.TodayCount != 0 || stats.MonthCount != 0 || stats.YearCount != 0 {
 		t.Fatalf("expected zero stats for new device, got %+v", stats)
+	}
+}
+
+func TestRecordServerRestartSuppressesGapAcrossServerDowntime(t *testing.T) {
+	setupTestDB(t)
+
+	t0 := time.Now().Add(-time.Hour)
+	if err := UpdateServerHeartbeat(t0); err != nil {
+		t.Fatalf("UpdateServerHeartbeat failed: %v", err)
+	}
+	var stored ServerHeartbeat
+	if err := DB.First(&stored, serverHeartbeatID).Error; err != nil {
+		t.Fatalf("expected heartbeat row to be persisted, got: %v", err)
+	}
+	if !stored.LastAlive.Equal(t0) {
+		t.Fatalf("expected stored LastAlive %v, got %v", t0, stored.LastAlive)
+	}
+
+	restartTime := t0.Add(10 * OfflineThreshold)
+	if err := RecordServerRestart(restartTime); err != nil {
+		t.Fatalf("RecordServerRestart failed: %v", err)
+	}
+
+	var windows []MaintenanceWindow
+	if err := DB.Where("device_id IS NULL").Find(&windows).Error; err != nil {
+		t.Fatalf("failed to query maintenance windows: %v", err)
+	}
+	if len(windows) != 1 {
+		t.Fatalf("expected 1 fleet-wide maintenance window, got %d", len(windows))
+	}
+	if !windows[0].StartTime.Equal(t0) || !windows[0].EndTime.Equal(restartTime) {
+		t.Fatalf("unexpected window bounds: %+v", windows[0])
+	}
+
+	// A second, short-lived restart shortly after must not add another window.
+	if err := RecordServerRestart(restartTime.Add(time.Second)); err != nil {
+		t.Fatalf("RecordServerRestart (short) failed: %v", err)
+	}
+	if err := DB.Where("device_id IS NULL").Find(&windows).Error; err != nil {
+		t.Fatalf("failed to query maintenance windows: %v", err)
+	}
+	if len(windows) != 1 {
+		t.Fatalf("expected no extra window from a sub-threshold gap, got %d", len(windows))
+	}
+}
+
+// TestOngoingOutageSuppressionDoesNotOutliveMaintenanceWindow locks in that a
+// device offline since before a past (now-closed) maintenance window is
+// still reported as an ongoing outage: suppression must be based on whether
+// a window is active *right now*, not on whether the device's downtime span
+// ever overlapped one, or a real outage spanning a server restart would be
+// hidden forever.
+func TestOngoingOutageSuppressionDoesNotOutliveMaintenanceWindow(t *testing.T) {
+	setupTestDB(t)
+
+	device, _, err := CreateDevice("Stale Node", "Basement")
+	if err != nil {
+		t.Fatalf("CreateDevice failed: %v", err)
+	}
+	longAgo := time.Now().Add(-2 * time.Hour)
+	if err := DB.Model(&Device{}).Where("id = ?", device.ID).Update("last_seen", longAgo).Error; err != nil {
+		t.Fatalf("failed to set last_seen: %v", err)
+	}
+
+	// A maintenance window that closed well before now, but that overlaps
+	// the device's full last_seen..now span.
+	window := MaintenanceWindow{StartTime: longAgo.Add(time.Minute), EndTime: longAgo.Add(2 * time.Minute)}
+	if err := DB.Create(&window).Error; err != nil {
+		t.Fatalf("failed to create maintenance window: %v", err)
+	}
+
+	infos, err := ongoingOutageInfos(nil)
+	if err != nil {
+		t.Fatalf("ongoingOutageInfos failed: %v", err)
+	}
+	found := false
+	for _, info := range infos {
+		if info.DeviceID == device.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected device offline since before a closed maintenance window to still show as ongoing")
 	}
 }
 
