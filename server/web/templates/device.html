@@ -201,15 +201,6 @@
 						<span class="badge bg-info text-dark">{{ .Cause }} · {{ .Confidence }}</span>
 						{{ if .Suppressed }}<span class="badge bg-secondary">maintenance</span>{{ end }}
                     </div>
-                    {{ if .ID }}
-                    <div class="mt-1">
-                        {{ if .AcknowledgedAt }}
-                        <span class="badge bg-success-subtle text-success-emphasis" title="{{ .Notes }}"><i class="bi bi-check2"></i> Acknowledged</span>
-                        {{ else }}
-                        <button type="button" class="btn btn-sm btn-outline-secondary py-0 acknowledge-outage-btn" data-outage-id="{{ .ID }}">Acknowledge</button>
-                        {{ end }}
-                    </div>
-                    {{ end }}
                 </div>
                 {{ end }}
                 {{ else }}
@@ -473,22 +464,6 @@
             } else {
                 alert('Failed to delete device');
             }
-        });
-
-        document.querySelectorAll('.acknowledge-outage-btn').forEach(btn => {
-            btn.addEventListener('click', async function () {
-                const notes = prompt('Optional note for this outage:') || '';
-                const resp = await fetch(`/api/outages/${btn.dataset.outageId}`, {
-                    method: 'PATCH',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ notes }),
-                });
-                if (resp.ok) {
-                    location.reload();
-                } else {
-                    alert('Failed to acknowledge outage');
-                }
-            });
         });
 
         document.getElementById('maintenanceFormEl')?.addEventListener('submit', async function (e) {
