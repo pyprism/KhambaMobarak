@@ -61,6 +61,11 @@ func metricsHandler(c *gin.Context) {
 		c.String(http.StatusInternalServerError, "# failed to load ongoing outages\n")
 		return
 	}
+	causeCounts, err := models.CountOutagesByCause()
+	if err != nil {
+		c.String(http.StatusInternalServerError, "# failed to load outage cause breakdown\n")
+		return
+	}
 
 	lines := []string{
 		"# HELP khamba_devices_total Total registered devices.",
@@ -72,12 +77,23 @@ func metricsHandler(c *gin.Context) {
 		"# HELP khamba_devices_offline Devices currently offline.",
 		"# TYPE khamba_devices_offline gauge",
 		fmt.Sprintf("khamba_devices_offline %d", len(devices)-online),
-		"# HELP khamba_outages_total Total persisted outage records.",
+		// khamba_outages_total excludes maintenance-suppressed rows and
+		// planned (deep-sleep) wakes; it is not a raw row count.
+		"# HELP khamba_outages_total Total persisted outage records, excluding maintenance and planned wakes.",
 		"# TYPE khamba_outages_total counter",
 		fmt.Sprintf("khamba_outages_total %d", totalOutages),
 		"# HELP khamba_outages_ongoing Devices currently in an outage.",
 		"# TYPE khamba_outages_ongoing gauge",
 		fmt.Sprintf("khamba_outages_ongoing %d", ongoingOutages),
+		"# HELP khamba_outages_power_total Persisted outages confirmed as power loss.",
+		"# TYPE khamba_outages_power_total counter",
+		fmt.Sprintf("khamba_outages_power_total %d", causeCounts.Power),
+		"# HELP khamba_outages_connectivity_total Persisted outages inferred as connectivity-only gaps.",
+		"# TYPE khamba_outages_connectivity_total counter",
+		fmt.Sprintf("khamba_outages_connectivity_total %d", causeCounts.Connectivity),
+		"# HELP khamba_outages_device_reset_total Persisted outages from a device-initiated reset.",
+		"# TYPE khamba_outages_device_reset_total counter",
+		fmt.Sprintf("khamba_outages_device_reset_total %d", causeCounts.DeviceReset),
 	}
 	c.String(http.StatusOK, strings.Join(lines, "\n")+"\n")
 }
