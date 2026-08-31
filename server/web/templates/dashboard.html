@@ -155,6 +155,10 @@
                     </div>
                     <small class="text-muted d-block">{{ .Location }}</small>
                     <div class="mt-1">
+                        <span class="badge bg-info text-dark">{{ .Cause }} · {{ .Confidence }}</span>
+                        {{ if .Suppressed }}<span class="badge bg-secondary">maintenance</span>{{ end }}
+                    </div>
+                    <div class="mt-1">
                         <small>
                             <i class="bi bi-clock"></i>
                             Started: <span data-time="{{ .StartTime.Format "2006-01-02T15:04:05Z07:00" }}">{{ .StartTime.Format "Jan 02 3:04 pm" }}</span>
